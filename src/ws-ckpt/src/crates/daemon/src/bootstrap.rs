@@ -120,9 +120,12 @@ pub async fn bootstrap(config: &DaemonConfig) -> anyhow::Result<()> {
     //    `btrfs filesystem resize` grow-in-place or a shrink path that
     //    unmounts + detaches the loop + truncates + remounts.
     if img_existed_before_bootstrap {
-        reconcile_img_size(config)
-            .await
-            .context("Failed to reconcile btrfs image size")?;
+        if let Err(e) = reconcile_img_size(config).await {
+            warn!(
+                "Failed to reconcile btrfs image size: {:#}. Continuing with current size.",
+                e
+            );
+        }
     }
 
     // 6. Ensure snapshots directory exists
