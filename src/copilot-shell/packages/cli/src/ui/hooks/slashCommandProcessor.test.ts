@@ -87,6 +87,14 @@ vi.mock('../../utils/cleanup.js', () => ({
   runExitCleanup: mockRunExitCleanup,
 }));
 
+const { mockUseKeypress } = vi.hoisted(() => ({
+  mockUseKeypress: vi.fn(),
+}));
+
+vi.mock('./useKeypress.js', () => ({
+  useKeypress: mockUseKeypress,
+}));
+
 function createTestCommand(
   overrides: Partial<SlashCommand>,
   kind: CommandKind = CommandKind.BUILT_IN,
@@ -128,6 +136,7 @@ describe('useSlashCommandProcessor', () => {
     fileCommands: SlashCommand[] = [],
     mcpCommands: SlashCommand[] = [],
     setIsProcessing = vi.fn(),
+    isProcessing = false,
   ) => {
     mockBuiltinLoadCommands.mockResolvedValue(Object.freeze(builtinCommands));
     mockFileLoadCommands.mockResolvedValue(Object.freeze(fileCommands));
@@ -142,6 +151,7 @@ describe('useSlashCommandProcessor', () => {
         mockLoadHistory,
         vi.fn(), // refreshStatic
         vi.fn(), // toggleVimEnabled
+        isProcessing,
         setIsProcessing,
         vi.fn(), // setGeminiMdFileCount
         {
@@ -900,24 +910,248 @@ describe('useSlashCommandProcessor', () => {
           mockClearItems,
           mockLoadHistory,
           vi.fn(), // refreshStatic
-          vi.fn(), // onDebugMessage
-          vi.fn(), // openThemeDialog
-          mockOpenAuthDialog,
-          vi.fn(), // openEditorDialog
-          mockSetQuittingMessages,
-          vi.fn(), // openSettingsDialog
-          vi.fn(), // openModelSelectionDialog
-          vi.fn(), // openSubagentCreateDialog
-          vi.fn(), // openAgentsManagerDialog
           vi.fn(), // toggleVimEnabled
+          false, // isProcessing
           vi.fn(), // setIsProcessing
           vi.fn(), // setGeminiMdFileCount
+          {
+            openAuthDialog: mockOpenAuthDialog,
+            openThemeDialog: vi.fn(),
+            openEditorDialog: vi.fn(),
+            openSettingsDialog: vi.fn(),
+            openModelDialog: vi.fn(),
+            quit: mockSetQuittingMessages,
+            setDebugMessage: vi.fn(),
+          },
         ),
       );
 
       unmount();
 
       expect(abortSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('ESC Cancel Flow', () => {
+    beforeEach(() => {
+      mockUseKeypress.mockClear();
+    });
+
+    it('should call useKeypress with isActive based on isProcessing state', async () => {
+      const setIsProcessing = vi.fn();
+      // Test with isProcessing = false
+      const result = setupProcessorHook([], [], [], setIsProcessing, false);
+
+      await waitFor(() => expect(result.current.slashCommands.length).toBe(0));
+
+      // useKeypress should be called with isActive: false when not processing
+      expect(mockUseKeypress).toHaveBeenCalledWith(expect.any(Function), {
+        isActive: false,
+      });
+    });
+
+    it('should pass abortSignal to command action', async () => {
+      const setIsProcessing = vi.fn();
+      let receivedAbortSignal: AbortSignal | undefined;
+
+      const commandAction = vi
+        .fn()
+        .mockImplementation(async (context: CommandContext) => {
+          receivedAbortSignal = context.abortSignal;
+          return { type: 'handled' };
+        });
+
+      const testCommand = createTestCommand({
+        name: 'signaltest',
+        action: commandAction,
+      });
+
+      const result = setupProcessorHook([testCommand], [], [], setIsProcessing);
+      await waitFor(() =>
+        expect(result.current.slashCommands.length).toBeGreaterThan(0),
+      );
+
+      await act(async () => {
+        await result.current.handleSlashCommand('/signaltest');
+      });
+
+      // Verify abortSignal was passed to command action
+      expect(commandAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          abortSignal: expect.any(AbortSignal),
+        }),
+        expect.any(String),
+      );
+      expect(receivedAbortSignal).toBeInstanceOf(AbortSignal);
+    });
+
+    it('should cancel slash command when ESC is pressed during processing', async () => {
+      const setIsProcessing = vi.fn();
+      const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
+      let keypressCallback: ((key: { name: string }) => void) | undefined;
+
+      // Mock useKeypress to capture the callback
+      mockUseKeypress.mockImplementation(
+        (callback: (key: { name: string }) => void) => {
+          keypressCallback = callback;
+        },
+      );
+
+      // Create a slow command that we can cancel
+      const commandAction = vi.fn().mockImplementation(async () => {
+        // Never resolve - will be cancelled by ESC
+        await new Promise(() => {});
+        return { type: 'handled' };
+      });
+
+      const testCommand = createTestCommand({
+        name: 'slow',
+        action: commandAction,
+      });
+
+      const result = setupProcessorHook([testCommand], [], [], setIsProcessing);
+      await waitFor(() =>
+        expect(result.current.slashCommands.length).toBeGreaterThan(0),
+      );
+
+      // Start the command (it will hang)
+      act(() => {
+        result.current.handleSlashCommand('/slow');
+      });
+
+      // Wait for the command to start processing
+      await waitFor(() => {
+        expect(setIsProcessing).toHaveBeenCalledWith(true);
+      });
+
+      // The keypress callback should now be registered
+      expect(keypressCallback).toBeDefined();
+
+      // Simulate ESC key press
+      act(() => {
+        keypressCallback!({ name: 'escape' });
+      });
+
+      // Verify cancelSlashCommand behavior:
+      // 1. AbortController is aborted
+      expect(abortSpy).toHaveBeenCalled();
+
+      // 2. INFO message is added
+      expect(mockAddItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: MessageType.INFO,
+          text: 'Command cancelled.',
+        }),
+        expect.any(Number),
+      );
+
+      // 3. isProcessing is set to false
+      expect(setIsProcessing).toHaveBeenCalledWith(false);
+
+      abortSpy.mockRestore();
+    });
+
+    it('should return handled type when command is cancelled via ESC', async () => {
+      const setIsProcessing = vi.fn();
+      let keypressCallback: ((key: { name: string }) => void) | undefined;
+
+      // Mock useKeypress to capture the callback
+      mockUseKeypress.mockImplementation(
+        (callback: (key: { name: string }) => void) => {
+          keypressCallback = callback;
+        },
+      );
+
+      // Create a command that listens for abort signal
+      const commandAction = vi
+        .fn()
+        .mockImplementation(async (context: CommandContext) => {
+          // Wait for abort or timeout
+          await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => resolve(), 10000);
+            context.abortSignal?.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(timeout);
+                resolve();
+              },
+              { once: true },
+            );
+          });
+          return { type: 'handled' };
+        });
+
+      const testCommand = createTestCommand({
+        name: 'cancelable',
+        action: commandAction,
+      });
+
+      const result = setupProcessorHook([testCommand], [], [], setIsProcessing);
+      await waitFor(() =>
+        expect(result.current.slashCommands.length).toBeGreaterThan(0),
+      );
+
+      // Start command and capture result
+      let handleResult: { type: string } | undefined;
+      const commandPromise = act(async () => {
+        handleResult = await result.current.handleSlashCommand('/cancelable');
+        return handleResult;
+      });
+
+      // Wait for processing to start
+      await waitFor(() => {
+        expect(setIsProcessing).toHaveBeenCalledWith(true);
+      });
+
+      // Press ESC to cancel
+      expect(keypressCallback).toBeDefined();
+      act(() => {
+        keypressCallback!({ name: 'escape' });
+      });
+
+      // Wait for command to complete
+      await commandPromise;
+
+      // Should return handled type, not error
+      expect(handleResult).toEqual({ type: 'handled' });
+
+      // Should NOT have any ERROR messages
+      const errorCalls = mockAddItem.mock.calls.filter(
+        (call) => call[0]?.type === MessageType.ERROR,
+      );
+      expect(errorCalls.length).toBe(0);
+    });
+
+    it('should not cancel if no AbortController exists', async () => {
+      const setIsProcessing = vi.fn();
+      let keypressCallback: ((key: { name: string }) => void) | undefined;
+
+      // Mock useKeypress to capture the callback with isActive=false
+      mockUseKeypress.mockImplementation(
+        (callback: (key: { name: string }) => void) => {
+          keypressCallback = callback;
+        },
+      );
+
+      setupProcessorHook([], [], [], setIsProcessing);
+
+      // keypressCallback should exist but isActive should be false
+      // (no command running, so no AbortController)
+      expect(keypressCallback).toBeDefined();
+
+      // Pressing ESC when nothing is processing should do nothing
+      mockAddItem.mockClear();
+      act(() => {
+        keypressCallback!({ name: 'escape' });
+      });
+
+      // Should NOT add "Command cancelled." message
+      expect(mockAddItem).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: 'Command cancelled.',
+        }),
+        expect.any(Number),
+      );
     });
   });
 
@@ -1048,6 +1282,61 @@ describe('useSlashCommandProcessor', () => {
         await result.current.handleSlashCommand('/unknown');
       });
       expect(logSlashCommand).not.toHaveBeenCalled();
+    });
+
+    it('should not log SUCCESS when command is cancelled via ESC', async () => {
+      const setIsProcessing = vi.fn();
+      let keypressCallback: ((key: { name: string }) => void) | undefined;
+
+      // Mock useKeypress to capture the callback
+      mockUseKeypress.mockImplementation(
+        (callback: (key: { name: string }) => void) => {
+          keypressCallback = callback;
+        },
+      );
+
+      // Create a slow command that can be cancelled
+      const commandAction = vi.fn().mockImplementation(async () => {
+        // Never resolve - will be cancelled by ESC
+        await new Promise(() => {});
+        return { type: 'handled' };
+      });
+
+      const testCommand = createTestCommand({
+        name: 'canceltest',
+        action: commandAction,
+      });
+
+      vi.mocked(logSlashCommand).mockClear();
+
+      const result = setupProcessorHook([testCommand], [], [], setIsProcessing);
+      await waitFor(() =>
+        expect(result.current.slashCommands.length).toBeGreaterThan(0),
+      );
+
+      // Start the command
+      act(() => {
+        result.current.handleSlashCommand('/canceltest');
+      });
+
+      // Wait for processing to start
+      await waitFor(() => {
+        expect(setIsProcessing).toHaveBeenCalledWith(true);
+      });
+
+      // Press ESC to cancel
+      expect(keypressCallback).toBeDefined();
+      act(() => {
+        keypressCallback!({ name: 'escape' });
+      });
+
+      // Should NOT log SUCCESS when cancelled
+      expect(logSlashCommand).not.toHaveBeenCalledWith(
+        mockConfig,
+        expect.objectContaining({
+          status: SlashCommandStatus.SUCCESS,
+        }),
+      );
     });
   });
 });

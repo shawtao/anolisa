@@ -901,6 +901,7 @@ export class GeminiClient {
   async tryCompressChat(
     prompt_id: string,
     force: boolean = false,
+    abortSignal?: AbortSignal,
   ): Promise<ChatCompressionInfo> {
     // Fire PreCompact hook before compression
     await this.firePreCompactHook(
@@ -916,6 +917,7 @@ export class GeminiClient {
       this.config.getModel(),
       this.config,
       this.hasFailedCompressionAttempt,
+      abortSignal,
     );
 
     // Handle compression result
