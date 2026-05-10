@@ -18,7 +18,6 @@ pub const INDEX_FILE: &str = "index.json";
 pub const BTRFS_IMG_PATH: &str = "/data/ws-ckpt/btrfs-data.img";
 pub const BTRFS_IMG_DIR: &str = "/data/ws-ckpt";
 pub const CONFIG_FILE_PATH: &str = "/etc/ws-ckpt/config.toml";
-pub const DEFAULT_FS_WARN_THRESHOLD_PERCENT: f64 = 90.0;
 pub const DEFAULT_IMG_SIZE_GB: u64 = 30;
 pub const DEFAULT_IMG_MAX_PERCENT: f64 = 0.4; // 40% as fraction for calculation
 
@@ -386,7 +385,6 @@ pub struct ConfigReport {
     pub auto_cleanup_keep: CleanupRetention,
     pub auto_cleanup_interval_secs: u64,
     pub health_check_interval_secs: u64,
-    pub fs_warn_threshold_percent: f64,
     pub img_path: String,
     pub img_size: u64,
     pub img_max_percent: f64,
@@ -407,8 +405,6 @@ pub struct DaemonConfig {
     pub health_check_interval_secs: u64,
     /// Backend type string from config: "auto" | "btrfs-base" | "btrfs-loop" | "overlayfs"
     pub backend_type: String,
-    /// Filesystem usage warning threshold (percentage, 0-100)
-    pub fs_warn_threshold_percent: f64,
     /// Loop image file path (runtime-only; always `BTRFS_IMG_PATH`, not user-configurable)
     pub img_path: String,
     /// Target image size in GB. The on-disk image is grown/shrunk to match this at bootstrap.
@@ -493,8 +489,6 @@ pub struct FileConfig {
     pub auto_cleanup_keep: Option<CleanupRetention>,
     pub auto_cleanup_interval_secs: Option<u64>,
     pub health_check_interval_secs: Option<u64>,
-    /// Filesystem usage warning threshold (percentage, 0-100)
-    pub fs_warn_threshold_percent: Option<f64>,
     /// Backend configuration section (optional; defaults to auto-detect)
     #[serde(default)]
     pub backend: BackendConfig,
@@ -536,7 +530,6 @@ impl Default for DaemonConfig {
             auto_cleanup_interval_secs: DEFAULT_AUTO_CLEANUP_INTERVAL_SECS,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
             backend_type: "auto".to_string(),
-            fs_warn_threshold_percent: DEFAULT_FS_WARN_THRESHOLD_PERCENT,
             img_path: BTRFS_IMG_PATH.to_string(),
             img_size: DEFAULT_IMG_SIZE_GB,
             img_max_percent: DEFAULT_IMG_MAX_PERCENT * 100.0, // stored as 0-100
@@ -1257,7 +1250,6 @@ mod tests {
                 auto_cleanup_keep: CleanupRetention::Count(20),
                 auto_cleanup_interval_secs: 86_400,
                 health_check_interval_secs: 300,
-                fs_warn_threshold_percent: 90.0,
                 img_path: "/data/ws-ckpt/btrfs-data.img".to_string(),
                 img_size: 30,
                 img_max_percent: 40.0,

@@ -248,8 +248,8 @@ async fn health_check(state: &DaemonState) {
         Ok((total, used)) => {
             if total > 0 {
                 let usage_pct = (used as f64 / total as f64) * 100.0;
-                let threshold = state.config.read().unwrap().fs_warn_threshold_percent;
-                if usage_pct > threshold {
+                const FS_WARN_THRESHOLD_PERCENT: f64 = 90.0;
+                if usage_pct > FS_WARN_THRESHOLD_PERCENT {
                     warn!(
                         "Filesystem usage critical: {:.1}% ({} / {} bytes)",
                         usage_pct, used, total

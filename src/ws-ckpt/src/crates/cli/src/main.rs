@@ -11,8 +11,8 @@ use ws_ckpt_common::{
     decode_payload, default_auto_cleanup_keep, encode_frame, load_config_file, save_config_file,
     ChangeType, CleanupRetention, DaemonConfig, ErrorCode, Request, Response, BTRFS_IMG_PATH,
     CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP, DEFAULT_AUTO_CLEANUP_INTERVAL_SECS,
-    DEFAULT_FS_WARN_THRESHOLD_PERCENT, DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_IMG_MAX_PERCENT,
-    DEFAULT_IMG_SIZE_GB, DEFAULT_MOUNT_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB,
+    DEFAULT_MOUNT_PATH, DEFAULT_SOCKET_PATH,
 };
 
 // Parse CLI value for `--auto-cleanup-keep`: integer -> Count mode, duration
@@ -155,10 +155,6 @@ enum Commands {
         #[arg(long)]
         health_check_interval: Option<u64>,
 
-        /// Set filesystem usage warning threshold (percentage, 0-100)
-        #[arg(long)]
-        fs_warn_threshold_percent: Option<f64>,
-
         /// Set target image size in GB (image will be grown/shrunk at next daemon restart)
         #[arg(long)]
         img_size: Option<u64>,
@@ -245,9 +241,6 @@ async fn run(cli: Cli) -> Result<()> {
                     .health_check_interval_secs
                     .unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
                 backend_type: file_config.backend.r#type.clone(),
-                fs_warn_threshold_percent: file_config
-                    .fs_warn_threshold_percent
-                    .unwrap_or(DEFAULT_FS_WARN_THRESHOLD_PERCENT),
                 img_path: BTRFS_IMG_PATH.to_string(),
                 img_size: file_config
                     .backend
@@ -353,7 +346,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Config {
             health_check_interval,
-            fs_warn_threshold_percent,
             img_size,
             img_max_percent,
             enable_auto_cleanup,
@@ -367,7 +359,6 @@ async fn run(cli: Cli) -> Result<()> {
                 _ => None,
             };
             if health_check_interval.is_none()
-                && fs_warn_threshold_percent.is_none()
                 && img_size.is_none()
                 && img_max_percent.is_none()
                 && auto_cleanup.is_none()
@@ -380,7 +371,6 @@ async fn run(cli: Cli) -> Result<()> {
                 // Update mode: modify config file + notify daemon
                 handle_config_update(
                     health_check_interval,
-                    fs_warn_threshold_percent,
                     img_size,
                     img_max_percent,
                     auto_cleanup,
@@ -768,9 +758,6 @@ fn handle_config_view() -> Result<()> {
     let health = fc
         .health_check_interval_secs
         .unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
-    let fs_warn = fc
-        .fs_warn_threshold_percent
-        .unwrap_or(DEFAULT_FS_WARN_THRESHOLD_PERCENT);
     let btrfs_loop = fc.backend.btrfs_loop.as_ref();
     let img_size = btrfs_loop
         .and_then(|b| b.img_size)
@@ -828,15 +815,6 @@ fn handle_config_view() -> Result<()> {
         }
     );
     println!(
-        "  FS warn threshold:       {}%{}",
-        fs_warn,
-        if fc.fs_warn_threshold_percent.is_none() {
-            " (default)"
-        } else {
-            ""
-        }
-    );
-    println!(
         "  Image path:              {} (fixed, not configurable)",
         BTRFS_IMG_PATH
     );
@@ -864,7 +842,6 @@ fn handle_config_view() -> Result<()> {
 /// Update configuration: write to config file + notify daemon to reload.
 async fn handle_config_update(
     health_check_interval: Option<u64>,
-    fs_warn_threshold_percent: Option<f64>,
     img_size: Option<u64>,
     img_max_percent: Option<f64>,
     auto_cleanup: Option<bool>,
@@ -880,9 +857,6 @@ async fn handle_config_update(
     // Apply updates
     if let Some(interval) = health_check_interval {
         fc.health_check_interval_secs = Some(interval);
-    }
-    if let Some(threshold) = fs_warn_threshold_percent {
-        fc.fs_warn_threshold_percent = Some(threshold);
     }
     if let Some(v) = auto_cleanup {
         fc.auto_cleanup = Some(v);
@@ -1557,13 +1531,11 @@ mod tests {
         match cli.command {
             Commands::Config {
                 health_check_interval,
-                fs_warn_threshold_percent,
                 img_size,
                 img_max_percent,
                 ..
             } => {
                 assert!(health_check_interval.is_none());
-                assert!(fs_warn_threshold_percent.is_none());
                 assert!(img_size.is_none());
                 assert!(img_max_percent.is_none());
             }
@@ -1578,8 +1550,6 @@ mod tests {
             "config",
             "--health-check-interval",
             "120",
-            "--fs-warn-threshold-percent",
-            "85",
             "--img-size",
             "30",
             "--img-max-percent",
@@ -1589,13 +1559,11 @@ mod tests {
         match cli.command {
             Commands::Config {
                 health_check_interval,
-                fs_warn_threshold_percent,
                 img_size,
                 img_max_percent,
                 ..
             } => {
                 assert_eq!(health_check_interval, Some(120));
-                assert_eq!(fs_warn_threshold_percent, Some(85.0));
                 assert_eq!(img_size, Some(30));
                 assert_eq!(img_max_percent, Some(40.0));
             }

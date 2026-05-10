@@ -321,7 +321,6 @@ mod tests {
             auto_cleanup_interval_secs: 86_400,
             health_check_interval_secs: 300,
             backend_type: "auto".to_string(),
-            fs_warn_threshold_percent: 90.0,
             img_path: "/data/ws-ckpt/btrfs-data.img".to_string(),
             img_size: 30,
             img_max_percent: 40.0,

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use ws_ckpt_common::{
     default_auto_cleanup_keep, load_config_file, ConfigReport, ErrorCode, Request, Response,
     StatusReport, WorkspaceInfo, CONFIG_FILE_PATH, DEFAULT_AUTO_CLEANUP,
-    DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_FS_WARN_THRESHOLD_PERCENT,
-    DEFAULT_HEALTH_CHECK_INTERVAL_SECS, DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB,
+    DEFAULT_AUTO_CLEANUP_INTERVAL_SECS, DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+    DEFAULT_IMG_MAX_PERCENT, DEFAULT_IMG_SIZE_GB,
 };
 
 pub async fn dispatch(state: &Arc<DaemonState>, request: Request) -> Response {
@@ -215,7 +215,6 @@ fn handle_config(state: &Arc<DaemonState>) -> Response {
             auto_cleanup_keep: cfg.auto_cleanup_keep.clone(),
             auto_cleanup_interval_secs: cfg.auto_cleanup_interval_secs,
             health_check_interval_secs: cfg.health_check_interval_secs,
-            fs_warn_threshold_percent: cfg.fs_warn_threshold_percent,
             img_path: cfg.img_path.clone(),
             img_size: cfg.img_size,
             img_max_percent: cfg.img_max_percent,
@@ -245,9 +244,6 @@ fn handle_reload_config(state: &Arc<DaemonState>) -> Response {
                 .health_check_interval_secs
                 .unwrap_or(DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
             cfg.backend_type = file_config.backend.r#type.clone();
-            cfg.fs_warn_threshold_percent = file_config
-                .fs_warn_threshold_percent
-                .unwrap_or(DEFAULT_FS_WARN_THRESHOLD_PERCENT);
 
             // img_* fields are bootstrap-only; compare against the new file values and
             // warn if they changed. We do NOT mutate cfg.img_size / cfg.img_max_percent
@@ -281,13 +277,12 @@ fn handle_reload_config(state: &Arc<DaemonState>) -> Response {
             }
 
             tracing::info!(
-                "Config reloaded: auto_cleanup={}, keep={}, cleanup_interval={}s, health_interval={}s, \
-                 fs_warn={}% (img fields are bootstrap-only; restart required to apply)",
+                "Config reloaded: auto_cleanup={}, keep={}, cleanup_interval={}s, health_interval={}s \
+                 (img fields are bootstrap-only; restart required to apply)",
                 cfg.auto_cleanup,
                 cfg.auto_cleanup_keep,
                 cfg.auto_cleanup_interval_secs,
                 cfg.health_check_interval_secs,
-                cfg.fs_warn_threshold_percent,
             );
             // Drop the write lock before notifying so woken loops can read the
             // fresh config without contending on the lock.
@@ -330,7 +325,6 @@ mod tests {
             auto_cleanup_interval_secs: 86_400,
             health_check_interval_secs: 300,
             backend_type: "auto".to_string(),
-            fs_warn_threshold_percent: 90.0,
             img_path: "/data/ws-ckpt/btrfs-data.img".to_string(),
             img_size: 30,
             img_max_percent: 40.0,
