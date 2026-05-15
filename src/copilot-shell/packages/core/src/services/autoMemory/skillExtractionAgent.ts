@@ -382,7 +382,7 @@ export function createExtractionHooks(
       // Track session reads (best-effort, never blocks validation).
       if (payload.success && chatsDir && onSessionRead) {
         if (payload.toolName === 'read_file') {
-          reportSessionRead(payload.args['absolute_path']);
+          reportSessionRead(payload.args['file_path']);
         } else if (payload.toolName === 'read_many_files') {
           const paths = payload.args['paths'];
           if (Array.isArray(paths)) {

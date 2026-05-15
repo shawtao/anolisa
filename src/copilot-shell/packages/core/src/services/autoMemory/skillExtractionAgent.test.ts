@@ -37,7 +37,7 @@ describe('createExtractionHooks session-read tracking', () => {
     });
     await hooks.postToolUse?.(
       makePayload('read_file', {
-        absolute_path: path.join(chatsDir, `${uuidA}.jsonl`),
+        file_path: path.join(chatsDir, `${uuidA}.jsonl`),
       }),
     );
     expect(reads).toEqual([uuidA]);
@@ -68,7 +68,7 @@ describe('createExtractionHooks session-read tracking', () => {
       onSessionRead: (sid) => reads.push(sid),
     });
     await hooks.postToolUse?.(
-      makePayload('read_file', { absolute_path: '/etc/passwd' }),
+      makePayload('read_file', { file_path: '/etc/passwd' }),
     );
     expect(reads).toEqual([]);
   });
@@ -82,7 +82,7 @@ describe('createExtractionHooks session-read tracking', () => {
     await hooks.postToolUse?.(
       makePayload(
         'read_file',
-        { absolute_path: path.join(chatsDir, `${uuidA}.jsonl`) },
+        { file_path: path.join(chatsDir, `${uuidA}.jsonl`) },
         /* success */ false,
       ),
     );
@@ -94,7 +94,7 @@ describe('createExtractionHooks session-read tracking', () => {
     // Should simply not throw, and not observe any side-effect.
     await hooks.postToolUse?.(
       makePayload('read_file', {
-        absolute_path: path.join(chatsDir, `${uuidA}.jsonl`),
+        file_path: path.join(chatsDir, `${uuidA}.jsonl`),
       }),
     );
   });
