@@ -479,11 +479,10 @@ impl ProcTrace {
 
     /// Add a cgroup inode id to the cgroup_filter map at runtime.
     ///
-    /// When the rodata flag `filter_cgroup_enabled` was set to true at load
-    /// time, only events from cgroups registered here will pass the cgroup
-    /// gate. The id must match what `get_cgroup_id_compat()` returns in BPF,
-    /// which equals `stat(cgroup_path).st_ino` for the corresponding
-    /// hierarchy (v2 unified path or v1 memory subsystem path).
+    /// When `filter_cgroup_enabled` was true at load time, cgroup membership is
+    /// combined with `traced_processes` using **OR**: a task passes if its PID is
+    /// in `traced_processes` **or** its cgroup id was added here. When the filter
+    /// is off, only the PID map applies.
     pub fn add_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
         let key = cgroup_id.to_ne_bytes();
         let val = 1u8.to_ne_bytes();

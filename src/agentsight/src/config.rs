@@ -121,6 +121,31 @@ pub struct DomainRule {
     pub pattern: String,
 }
 
+// ==================== Probe Enable/Disable Configuration ====================
+
+/// Per-probe enable/disable configuration.
+/// Fields absent from the JSON config use these defaults.
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    pub sslsniff: bool,       // default: true
+    pub procmon: bool,        // default: true
+    pub filewatch: bool,      // default: false
+    pub filewrite: bool,      // default: true
+    pub udpdns: Option<bool>, // None = auto (enable if domain_rules non-empty)
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            sslsniff: true,
+            procmon: true,
+            filewatch: false,
+            filewrite: true,
+            udpdns: None,
+        }
+    }
+}
+
 // ==================== Agent Discovery Configuration ====================
 
 /// Default agents configuration JSON (embedded in binary).
@@ -141,6 +166,28 @@ struct JsonFullConfig {
     cmdline: Option<JsonCmdline>,
     #[serde(default)]
     domain: Option<Vec<JsonDomainGroup>>,
+    #[serde(default)]
+    probes: Option<JsonProbes>,
+    #[serde(default)]
+    target_pids: Option<Vec<u32>>,
+    #[serde(default)]
+    cgroup_filter_enabled: Option<bool>,
+    #[serde(default)]
+    cgroup_ids: Option<Vec<u64>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct JsonProbes {
+    #[serde(default)]
+    sslsniff: Option<bool>,
+    #[serde(default)]
+    procmon: Option<bool>,
+    #[serde(default)]
+    filewatch: Option<bool>,
+    #[serde(default)]
+    filewrite: Option<bool>,
+    #[serde(default)]
+    udpdns: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -276,17 +323,29 @@ pub struct AgentsightConfig {
     pub purge_interval: u64,
 
     // --- Probe Configuration ---
+    /// Target PIDs for process tracing (empty = no PID restriction)
+    pub target_pids: Vec<u32>,
     /// Optional UID filter for process tracing
     pub target_uid: Option<u32>,
     /// Poll timeout for ring buffer polling (milliseconds)
     pub poll_timeout_ms: u64,
     /// Enable file watch probe (monitors .jsonl file opens from traced processes)
     pub enable_filewatch: bool,
-    /// Enable cgroup-level event filtering. When true, proctrace /
-    /// filewatch / filewrite only emit events from cgroup ids
-    /// registered via `Probes::add_traced_cgroup`. procmon is unaffected
-    /// (full audit coverage). Default: false (no cgroup filtering).
+    /// Per-probe enable/disable configuration (parsed from JSON "probes" object).
+    /// `probe_config.filewatch` is the authoritative value; the legacy
+    /// `enable_filewatch` field is preserved only for back-compat references.
+    pub probe_config: ProbeConfig,
+    /// Enable cgroup-level event filtering alongside PID tracing. When true,
+    /// proctrace / filewatch / filewrite admit events when **either** the PID is in
+    /// `traced_processes` **or** the task cgroup id is listed in `cgroup_filter`
+    /// (including ids pre-registered from `cgroup_ids`). procmon is unaffected.
+    /// Default: false (PID map only).
     pub cgroup_filter_enabled: bool,
+    /// Cgroup inode IDs seeded into `cgroup_filter` at startup.
+    /// Only effective when `cgroup_filter_enabled` is true.
+    /// Obtain via `stat -c %i /sys/fs/cgroup/<path>` (v2) or
+    /// `stat -c %i /sys/fs/cgroup/memory/<path>` (v1).
+    pub cgroup_ids: Vec<u64>,
 
     // --- HTTP/Aggregation Configuration ---
     /// LRU cache capacity for HTTP connections
@@ -338,10 +397,13 @@ impl Default for AgentsightConfig {
             purge_interval: DEFAULT_PURGE_INTERVAL,
 
             // Probe defaults
+            target_pids: Vec::new(),
             target_uid: None,
             poll_timeout_ms: DEFAULT_POLL_TIMEOUT_MS,
             enable_filewatch: false,
+            probe_config: ProbeConfig::default(),
             cgroup_filter_enabled: false,
+            cgroup_ids: Vec::new(),
 
             // HTTP/Aggregation defaults
             connection_capacity: DEFAULT_CONNECTION_CAPACITY,
@@ -412,6 +474,12 @@ impl AgentsightConfig {
         self
     }
 
+    /// Set target PIDs
+    pub fn set_target_pids(mut self, pids: Vec<u32>) -> Self {
+        self.target_pids = pids;
+        self
+    }
+
     /// Set target UID
     pub fn set_target_uid(mut self, uid: Option<u32>) -> Self {
         self.target_uid = uid;
@@ -421,6 +489,21 @@ impl AgentsightConfig {
     /// Set enable_filewatch
     pub fn set_enable_filewatch(mut self, enable: bool) -> Self {
         self.enable_filewatch = enable;
+        self
+    }
+
+    /// Set the entire ProbeConfig (overwrites any previous value).
+    pub fn set_probe_config(mut self, probe_config: ProbeConfig) -> Self {
+        self.probe_config = probe_config;
+        self
+    }
+
+    /// Override filewatch setting from CLI --enable-filewatch flag.
+    /// CLI flag takes priority over config file setting (only when `enable=true`).
+    pub fn override_filewatch(mut self, enable: bool) -> Self {
+        if enable {
+            self.probe_config.filewatch = true;
+        }
         self
     }
 
@@ -458,6 +541,40 @@ impl AgentsightConfig {
         }
         if let Some(p) = parsed.log_path.take() {
             self.log_path = Some(p);
+        }
+
+        // Parse the optional "probes" object: any field that is absent keeps
+        // the existing default. `udpdns: null/absent` keeps the auto-detect
+        // behaviour (None); an explicit boolean overrides auto-detect.
+        if let Some(jp) = parsed.probes.take() {
+            let mut pc = ProbeConfig::default();
+            if let Some(v) = jp.sslsniff {
+                pc.sslsniff = v;
+            }
+            if let Some(v) = jp.procmon {
+                pc.procmon = v;
+            }
+            if let Some(v) = jp.filewatch {
+                pc.filewatch = v;
+            }
+            if let Some(v) = jp.filewrite {
+                pc.filewrite = v;
+            }
+            if let Some(v) = jp.udpdns {
+                pc.udpdns = Some(v);
+            }
+            self.probe_config = pc;
+        }
+
+        if let Some(pids) = parsed.target_pids.take() {
+            self.target_pids = pids;
+        }
+
+        if let Some(v) = parsed.cgroup_filter_enabled {
+            self.cgroup_filter_enabled = v;
+        }
+        if let Some(ids) = parsed.cgroup_ids.take() {
+            self.cgroup_ids = ids;
         }
 
         let (cmdline_rules, domain_rules) = extract_rules(parsed);

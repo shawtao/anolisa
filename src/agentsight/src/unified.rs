@@ -148,13 +148,23 @@ impl AgentSight {
 
         let all_cmdline_rules = config.cmdline_rules.clone();
 
-        // Create probes - agent discovery is handled by AgentScanner via ProcMon events
-        let enable_udpdns = !config.domain_rules.is_empty();
+        // Re-apply CLI --enable-filewatch override AFTER JSON load so the CLI
+        // flag always wins over `probes.filewatch` in the config file.
+        if config.enable_filewatch {
+            config.probe_config.filewatch = true;
+        }
+
+        // Create probes - agent discovery is handled by AgentScanner via ProcMon events.
+        // Resolve udpdns: explicit config wins; None = auto-enable if domain_rules non-empty.
+        let enable_udpdns = config
+            .probe_config
+            .udpdns
+            .unwrap_or_else(|| !config.domain_rules.is_empty());
         let mut probes =
             Probes::new_with_cgroup_filter(
-                &[],
+                &config.target_pids,
                 config.target_uid,
-                config.enable_filewatch,
+                &config.probe_config,
                 enable_udpdns,
                 config.cgroup_filter_enabled,
             )
@@ -162,6 +172,15 @@ impl AgentSight {
 
         // Attach procmon for process monitoring
         probes.attach().context("Failed to attach probes")?;
+
+        // Register configured cgroup IDs into the BPF cgroup_filter map
+        if config.cgroup_filter_enabled && !config.cgroup_ids.is_empty() {
+            for &cg_id in &config.cgroup_ids {
+                probes.add_traced_cgroup(cg_id)
+                    .context(format!("failed to register cgroup_id {}", cg_id))?;
+                log::info!("Registered cgroup_id {} in cgroup_filter map", cg_id);
+            }
+        }
 
         // Create scanner with all rules (allow/deny/domain)
         let mut scanner = AgentScanner::from_rules(&all_cmdline_rules, &config.domain_rules);
@@ -530,7 +549,7 @@ impl AgentSight {
 
     /// Handle FileWatch event via registered callback
     fn handle_filewatch_event(&self, event: &FileWatchEvent) {
-        log::debug!("FileWatch: pid={} file={}", event.pid, event.filename);
+        log::debug!("FileWatch: pid={} tid={} uid={} cgroup_id={} file={} flags={}", event.pid, event.tid, event.uid, event.cgroup_id, event.filename, event.flags);
         if let Some(ref cb) = self.filewatch_callback {
             cb(event.clone());
         }

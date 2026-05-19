@@ -65,7 +65,8 @@ impl TraceCommand {
         // Build AgentSight config (empty target_pids means trace all processes)
         let config = AgentsightConfig::new()
             .set_verbose(self.verbose)
-            .set_enable_filewatch(self.enable_filewatch);
+            .set_enable_filewatch(self.enable_filewatch)
+            .override_filewatch(self.enable_filewatch);
 
         // Set config_path for unified loading in AgentSight::new()
         let config = config.set_config_path(std::path::PathBuf::from(&self.config));

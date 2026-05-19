@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::event::Event;
+use crate::config::ProbeConfig;
 
 use super::proctrace::{ProcTrace, VariableEvent, ProcEventHeader};
 use super::sslsniff::SslSniff;
@@ -43,14 +44,14 @@ const EVENT_SOURCE_UDPDNS: u32 = 6;
 pub struct Probes {
     /// Process trace probe (owns the traced_processes map and ring buffer)
     proctrace: ProcTrace,
-    /// SSL sniff probe (reuses proctrace's traced_processes map and ring buffer)
-    sslsniff: SslSniff,
-    /// Process monitor probe (reuses ring buffer)
-    procmon: ProcMon,
+    /// SSL sniff probe (reuses proctrace's traced_processes map and ring buffer, optional)
+    sslsniff: Option<SslSniff>,
+    /// Process monitor probe (reuses ring buffer, optional)
+    procmon: Option<ProcMon>,
     /// File watch probe (reuses traced_processes map and ring buffer, optional)
     filewatch: Option<FileWatch>,
-    /// File write probe (reuses traced_processes map and ring buffer, always enabled)
-    filewrite: FileWriteProbe,
+    /// File write probe (reuses traced_processes map and ring buffer, optional)
+    filewrite: Option<FileWriteProbe>,
     /// UDP DNS probe (reuses ring buffer, captures domains from DNS queries, optional)
     udpdns: Option<UdpDns>,
     /// Shared ring buffer handle (cloned from proctrace) for polling
@@ -74,10 +75,14 @@ impl Probes {
         enable_filewatch: bool,
         enable_udpdns: bool,
     ) -> Result<Self> {
+        let probe_config = ProbeConfig {
+            filewatch: enable_filewatch,
+            ..ProbeConfig::default()
+        };
         Self::new_with_cgroup_filter(
             target_pids,
             target_uid,
-            enable_filewatch,
+            &probe_config,
             enable_udpdns,
             false,
         )
@@ -85,15 +90,18 @@ impl Probes {
 
     /// Create a new unified probe manager with explicit cgroup-level filtering toggle.
     ///
-    /// When `cgroup_filter_enabled` is true, every probe (except procmon, which
-    /// keeps full audit coverage) gates its events behind the shared
-    /// `cgroup_filter` map. Cgroup ids can then be registered at runtime via
-    /// `add_traced_cgroup`. When false (default), every probe behaves exactly
-    /// like before this feature existed.
+    /// When `cgroup_filter_enabled` is true, probes that honor the cgroup map
+    /// admit events when **either** the PID is in `traced_processes` **or** the
+    /// task's cgroup id is registered in `cgroup_filter` (OR semantics). When
+    /// false, only the PID map is used. Procmon stays unfiltered (full-system).
+    ///
+    /// `enable_udpdns` is the resolved final value (after auto-detection in
+    /// the caller; e.g. `unified.rs` consults both `probe_config.udpdns` and
+    /// `domain_rules`).
     pub fn new_with_cgroup_filter(
         target_pids: &[u32],
         target_uid: Option<u32>,
-        enable_filewatch: bool,
+        probe_config: &ProbeConfig,
         enable_udpdns: bool,
         cgroup_filter_enabled: bool,
     ) -> Result<Self> {
@@ -129,15 +137,29 @@ impl Probes {
         let cgroup_filter_ref = cgroup_filter_handle.as_ref();
 
         // Create sslsniff - it will reuse both the traced_processes map and ring buffer
-        let sslsniff = SslSniff::new_with_traced_processes(Some(&map_handle), Some(&rb_handle))
-            .context("failed to create sslsniff")?;
+        let sslsniff = if probe_config.sslsniff {
+            Some(
+                SslSniff::new_with_traced_processes(Some(&map_handle), Some(&rb_handle))
+                    .context("failed to create sslsniff")?,
+            )
+        } else {
+            log::info!("SslSniff probe disabled by config");
+            None
+        };
 
         // Create procmon - it reuses the ring buffer (no cgroup filter: full audit)
-        let procmon = ProcMon::new_with_rb(&rb_handle)
-            .context("failed to create procmon")?;
+        let procmon = if probe_config.procmon {
+            Some(
+                ProcMon::new_with_rb(&rb_handle)
+                    .context("failed to create procmon")?,
+            )
+        } else {
+            log::info!("ProcMon probe disabled by config");
+            None
+        };
 
         // Optionally create filewatch - it reuses both the traced_processes map and ring buffer
-        let filewatch = if enable_filewatch {
+        let filewatch = if probe_config.filewatch {
             let fw = FileWatch::new_with_full_maps(
                 &map_handle,
                 &rb_handle,
@@ -147,18 +169,25 @@ impl Probes {
             .context("failed to create filewatch")?;
             Some(fw)
         } else {
-            log::info!("FileWatch probe disabled");
+            log::info!("FileWatch probe disabled by config");
             None
         };
 
-        // Create filewrite - it reuses both the traced_processes map and ring buffer (always enabled)
-        let filewrite = FileWriteProbe::new_with_full_maps(
-            &map_handle,
-            &rb_handle,
-            cgroup_filter_ref,
-            cgroup_filter_enabled,
-        )
-        .context("failed to create filewrite")?;
+        // Optionally create filewrite - it reuses both the traced_processes map and ring buffer
+        let filewrite = if probe_config.filewrite {
+            Some(
+                FileWriteProbe::new_with_full_maps(
+                    &map_handle,
+                    &rb_handle,
+                    cgroup_filter_ref,
+                    cgroup_filter_enabled,
+                )
+                .context("failed to create filewrite")?,
+            )
+        } else {
+            log::info!("FileWrite probe disabled by config");
+            None
+        };
 
         // Optionally create udpdns - it reuses traced_processes map and ring buffer
         // Skips already-traced processes to avoid redundant discovery events
@@ -188,18 +217,20 @@ impl Probes {
 
     /// Attach all probes
     pub fn attach(&mut self) -> Result<()> {
-        // Attach procmon for process monitoring
-        self.procmon.attach()
-            .context("failed to attach procmon")?;
+        // Attach procmon for process monitoring (if enabled)
+        if let Some(ref mut p) = self.procmon {
+            p.attach().context("failed to attach procmon")?;
+        }
         self.proctrace.attach().context("failed to attach proctrace")?;
         // Attach filewatch for .jsonl file monitoring (if enabled)
         if let Some(ref mut fw) = self.filewatch {
             fw.attach()
                 .context("failed to attach filewatch")?;
         }
-        // Attach filewrite for JSON write monitoring (always enabled)
-        self.filewrite.attach()
-            .context("failed to attach filewrite")?;
+        // Attach filewrite for JSON write monitoring (if enabled)
+        if let Some(ref mut fw) = self.filewrite {
+            fw.attach().context("failed to attach filewrite")?;
+        }
         // Attach udpdns for DNS query capture (if enabled)
         if let Some(ref mut dns) = self.udpdns {
             dns.attach()
@@ -216,8 +247,10 @@ impl Probes {
 
     /// Attach SSL probes to a specific process
     pub fn attach_ssl_to_process(&mut self, pid: i32) -> Result<()> {
-        self.sslsniff.attach_process(pid)
-            .context("failed to attach sslsniff to process")?;
+        if let Some(ref mut s) = self.sslsniff {
+            s.attach_process(pid)
+                .context("failed to attach sslsniff to process")?;
+        }
         Ok(())
     }
 
@@ -232,6 +265,15 @@ impl Probes {
         let filewatch_event_size = mem::size_of::<RawFileWatchEvent>();
         let filewrite_event_size = mem::size_of::<RawFileWriteEvent>();
         let udpdns_event_size = mem::size_of::<RawUdpDnsEvent>();
+
+        // Capture probe-enabled flags so the poller closure (`move`) can skip
+        // events from disabled probes without holding a reference to `self`.
+        // In practice disabled probes never attach, so this is defensive only.
+        let has_sslsniff = self.sslsniff.is_some();
+        let has_procmon = self.procmon.is_some();
+        let has_filewatch = self.filewatch.is_some();
+        let has_filewrite = self.filewrite.is_some();
+        let has_udpdns = self.udpdns.is_some();
 
         let event_tx = self.event_tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -256,6 +298,7 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_SSL => {
+                        if !has_sslsniff { return 0; }
                         // SSL event - convert raw BPF data to user-space SslEvent
                         if data.len() >= ssl_event_size {
                             // SAFETY: BPF guarantees layout and alignment
@@ -267,6 +310,7 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_PROCMON => {
+                        if !has_procmon { return 0; }
                         // Process monitor event
                         if data.len() >= procmon_event_size {
                             super::procmon::Event::from_bytes(data).map(Event::ProcMon)
@@ -275,6 +319,7 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_FILEWATCH => {
+                        if !has_filewatch { return 0; }
                         // File watch event
                         if data.len() >= filewatch_event_size {
                             super::filewatch::FileWatchEvent::from_bytes(data).map(Event::FileWatch)
@@ -283,6 +328,7 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_FILEWRITE => {
+                        if !has_filewrite { return 0; }
                         // File write event (JSON content)
                         if data.len() >= filewrite_event_size {
                             super::filewrite::FileWriteEvent::from_bytes(data).map(Event::FileWrite)
@@ -291,6 +337,7 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_UDPDNS => {
+                        if !has_udpdns { return 0; }
                         // UDP DNS event (domain name from DNS query)
                         if data.len() >= udpdns_event_size {
                             super::udpdns::UdpDnsEvent::from_bytes(data).map(Event::UdpDns)
