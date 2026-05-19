@@ -2,7 +2,7 @@
 // Copyright (c) 2025 AgentSight Project
 //
 // File write BPF program
-// Monitors vfs_write calls from traced processes writing to .jsonl files
+// Monitors vfs_write to .jsonl (traced PID or allowed cgroup)
 // Uses fentry (BPF trampoline) for minimal overhead on the hot vfs_write path
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
@@ -10,6 +10,7 @@
 #include <bpf/bpf_tracing.h>
 #include "filewrite.h"
 #include "common.h"
+#include "cgroup_helper.h"
 
 // UUID format: 8-4-4-4-12 hex digits with hyphens (36 chars total)
 #define UUID_LEN 36
@@ -48,9 +49,8 @@ int BPF_PROG(trace_vfs_write, struct file *file, const char *buf, size_t count, 
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
 
-    // Only monitor traced processes
-    u32 *val = bpf_map_lookup_elem(&traced_processes, &pid);
-    if (!val)
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
         return 0;
 
     // Extract filename from file->f_path.dentry->d_name.name (basename)
@@ -96,6 +96,7 @@ int BPF_PROG(trace_vfs_write, struct file *file, const char *buf, size_t count, 
     event->uid = bpf_get_current_uid_gid();
     event->write_size = (u32)count;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->cgroup_id = cg_id;
 
     // Copy filename we already read into the event
     __builtin_memcpy(event->filename, fname, MAX_FILENAME_LEN);

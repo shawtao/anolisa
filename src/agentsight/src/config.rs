@@ -282,6 +282,11 @@ pub struct AgentsightConfig {
     pub poll_timeout_ms: u64,
     /// Enable file watch probe (monitors .jsonl file opens from traced processes)
     pub enable_filewatch: bool,
+    /// Enable cgroup-level event filtering. When true, proctrace /
+    /// filewatch / filewrite only emit events from cgroup ids
+    /// registered via `Probes::add_traced_cgroup`. procmon is unaffected
+    /// (full audit coverage). Default: false (no cgroup filtering).
+    pub cgroup_filter_enabled: bool,
 
     // --- HTTP/Aggregation Configuration ---
     /// LRU cache capacity for HTTP connections
@@ -336,6 +341,7 @@ impl Default for AgentsightConfig {
             target_uid: None,
             poll_timeout_ms: DEFAULT_POLL_TIMEOUT_MS,
             enable_filewatch: false,
+            cgroup_filter_enabled: false,
 
             // HTTP/Aggregation defaults
             connection_capacity: DEFAULT_CONNECTION_CAPACITY,
@@ -415,6 +421,17 @@ impl AgentsightConfig {
     /// Set enable_filewatch
     pub fn set_enable_filewatch(mut self, enable: bool) -> Self {
         self.enable_filewatch = enable;
+        self
+    }
+
+    /// Enable or disable cgroup-level event filtering.
+    ///
+    /// When enabled, only events from cgroup ids registered via
+    /// `Probes::add_traced_cgroup` are emitted by the filtered probes.
+    /// procmon keeps full audit coverage regardless. Must be set before
+    /// probes are created (the value is baked into the BPF rodata at load).
+    pub fn set_cgroup_filter_enabled(mut self, enabled: bool) -> Self {
+        self.cgroup_filter_enabled = enabled;
         self
     }
 
@@ -611,6 +628,7 @@ mod tests {
         assert!(config.log_path.is_none());
         assert!(config.target_uid.is_none());
         assert!(!config.enable_filewatch);
+        assert!(!config.cgroup_filter_enabled);
         assert_eq!(config.retention_days, 30);
         assert_eq!(config.purge_interval, 1000);
     }

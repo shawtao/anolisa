@@ -48,4 +48,35 @@ struct
 } traced_processes SEC(".maps");
 #endif
 
+/* ========== cgroup filter ==========
+ *
+ * Optional cgroup-level filter shared across all probes that include common.h.
+ * When `filter_cgroup_enabled` is false (default), only `traced_processes`
+ * gates events (legacy behavior).
+ * When enabled, an event passes if EITHER the PID is in `traced_processes`
+ * OR its cgroup id is listed in `cgroup_filter` — cgroup membership observes
+ * all processes under registered cgroups without pre-registering each PID.
+ * Use `traced_pid_cgroup_gate_allow(traced_map_pid, &cg_id)` in cgroup_helper.h
+ * (include common.h first): `traced_map_pid` is the key into `traced_processes`
+ * (current tgid or parent tgid on exec enter); `cg_id` is always current task.
+ *
+ * Probes that act as full-system audit (e.g. procmon) should define
+ * NO_CGROUP_FILTER before including common.h to opt out entirely.
+ */
+#ifndef NO_CGROUP_FILTER
+#ifndef MAX_CGROUP_FILTER_ENTRIES
+#define MAX_CGROUP_FILTER_ENTRIES 512
+#endif
+
+const volatile bool filter_cgroup_enabled = false;
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_CGROUP_FILTER_ENTRIES);
+    __type(key, u64);    /* cgroup inode id from get_cgroup_id_compat() */
+    __type(value, u8);   /* 1 = tracked */
+} cgroup_filter SEC(".maps");
+#endif
+
 #endif

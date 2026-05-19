@@ -151,7 +151,14 @@ impl AgentSight {
         // Create probes - agent discovery is handled by AgentScanner via ProcMon events
         let enable_udpdns = !config.domain_rules.is_empty();
         let mut probes =
-            Probes::new(&[], config.target_uid, config.enable_filewatch, enable_udpdns).context("Failed to create probes")?;
+            Probes::new_with_cgroup_filter(
+                &[],
+                config.target_uid,
+                config.enable_filewatch,
+                enable_udpdns,
+                config.cgroup_filter_enabled,
+            )
+            .context("Failed to create probes")?;
 
         // Attach procmon for process monitoring
         probes.attach().context("Failed to attach probes")?;
