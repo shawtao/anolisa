@@ -23,6 +23,9 @@ use super::procmon::{ProcMon, ProcMonEvent};
 use super::filewatch::{FileWatch, RawFileWatchEvent};
 use super::filewrite::{FileWrite as FileWriteProbe, RawFileWriteEvent};
 use super::udpdns::{UdpDns, RawUdpDnsEvent};
+use super::procfs::{ProcFsProbe, ProcFsEvent, RawProcFsEvent};
+use super::procnet::{ProcNetProbe, ProcNetEvent, RawProcNetEvent};
+use super::procsig::{ProcSigProbe, ProcSigEvent, RawProcSigEvent};
 
 const POLL_TIMEOUT_MS: u64 = 100;
 
@@ -33,6 +36,9 @@ const EVENT_SOURCE_PROCMON: u32 = 3;
 const EVENT_SOURCE_FILEWATCH: u32 = 4;
 const EVENT_SOURCE_FILEWRITE: u32 = 5;
 const EVENT_SOURCE_UDPDNS: u32 = 6;
+const EVENT_SOURCE_PROCFS: u32 = 7;
+const EVENT_SOURCE_PROCNET: u32 = 8;
+const EVENT_SOURCE_PROCSIG: u32 = 9;
 
 /// Unified probe manager that coordinates sslsniff and proctrace
 /// 
@@ -54,6 +60,12 @@ pub struct Probes {
     filewrite: Option<FileWriteProbe>,
     /// UDP DNS probe (reuses ring buffer, captures domains from DNS queries, optional)
     udpdns: Option<UdpDns>,
+    /// Filesystem operations probe (optional)
+    procfs: Option<ProcFsProbe>,
+    /// Network operations probe (optional)
+    procnet: Option<ProcNetProbe>,
+    /// Signal/process control probe (optional)
+    procsig: Option<ProcSigProbe>,
     /// Shared ring buffer handle (cloned from proctrace) for polling
     rb_handle: MapHandle,
     /// Unified event channel - events are converted to Event type inside the poller
@@ -200,6 +212,57 @@ impl Probes {
             None
         };
 
+        // Optionally create procfs - it reuses traced_processes map, ring buffer
+        // and (when enabled) the cgroup_filter map.
+        let procfs = if probe_config.procfs {
+            Some(
+                ProcFsProbe::new_with_full_maps(
+                    &map_handle,
+                    &rb_handle,
+                    cgroup_filter_ref,
+                    cgroup_filter_enabled,
+                )
+                .context("failed to create procfs probe")?,
+            )
+        } else {
+            log::info!("ProcFs probe disabled by config");
+            None
+        };
+
+        // Optionally create procnet - it reuses traced_processes map, ring buffer
+        // and (when enabled) the cgroup_filter map.
+        let procnet = if probe_config.procnet {
+            Some(
+                ProcNetProbe::new_with_full_maps(
+                    &map_handle,
+                    &rb_handle,
+                    cgroup_filter_ref,
+                    cgroup_filter_enabled,
+                )
+                .context("failed to create procnet probe")?,
+            )
+        } else {
+            log::info!("ProcNet probe disabled by config");
+            None
+        };
+
+        // Optionally create procsig - it reuses traced_processes map, ring buffer
+        // and (when enabled) the cgroup_filter map.
+        let procsig = if probe_config.procsig {
+            Some(
+                ProcSigProbe::new_with_full_maps(
+                    &map_handle,
+                    &rb_handle,
+                    cgroup_filter_ref,
+                    cgroup_filter_enabled,
+                )
+                .context("failed to create procsig probe")?,
+            )
+        } else {
+            log::info!("ProcSig probe disabled by config");
+            None
+        };
+
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         
         Ok(Self {
@@ -209,6 +272,9 @@ impl Probes {
             filewatch,
             filewrite,
             udpdns,
+            procfs,
+            procnet,
+            procsig,
             rb_handle,
             event_tx,
             event_rx,
@@ -236,6 +302,18 @@ impl Probes {
             dns.attach()
                 .context("failed to attach udpdns")?;
         }
+        // Attach procfs (filesystem ops) if enabled
+        if let Some(ref mut p) = self.procfs {
+            p.attach().context("failed to attach procfs")?;
+        }
+        // Attach procnet (network ops) if enabled
+        if let Some(ref mut p) = self.procnet {
+            p.attach().context("failed to attach procnet")?;
+        }
+        // Attach procsig (signal/process control) if enabled
+        if let Some(ref mut p) = self.procsig {
+            p.attach().context("failed to attach procsig")?;
+        }
         // sslsniff uses uprobes attached per-process via attach_process()
         Ok(())
     }
@@ -257,14 +335,19 @@ impl Probes {
     /// Start polling for events from the shared ring buffer
     ///
     /// A single background thread polls the shared ring buffer and dispatches
-    /// events as unified Event type to the channel.
-    pub fn run(&self) -> Result<ProbesPoller> {
+    /// events as unified Event type to the channel. When any of the proc-ext
+    /// probes (procfs/procnet/procsig) are active, an additional flush thread
+    /// drains their per-CPU aggregation maps every `flush_interval_ms`.
+    pub fn run(&self, flush_interval_ms: u64) -> Result<ProbesPoller> {
         let proc_min_sz = mem::size_of::<ProcEventHeader>();
         let ssl_event_size = mem::size_of::<RawSslEvent>();
         let procmon_event_size = mem::size_of::<ProcMonEvent>();
         let filewatch_event_size = mem::size_of::<RawFileWatchEvent>();
         let filewrite_event_size = mem::size_of::<RawFileWriteEvent>();
         let udpdns_event_size = mem::size_of::<RawUdpDnsEvent>();
+        let procfs_event_size = mem::size_of::<RawProcFsEvent>();
+        let procnet_event_size = mem::size_of::<RawProcNetEvent>();
+        let procsig_event_size = mem::size_of::<RawProcSigEvent>();
 
         // Capture probe-enabled flags so the poller closure (`move`) can skip
         // events from disabled probes without holding a reference to `self`.
@@ -274,6 +357,9 @@ impl Probes {
         let has_filewatch = self.filewatch.is_some();
         let has_filewrite = self.filewrite.is_some();
         let has_udpdns = self.udpdns.is_some();
+        let has_procfs = self.procfs.is_some();
+        let has_procnet = self.procnet.is_some();
+        let has_procsig = self.procsig.is_some();
 
         let event_tx = self.event_tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -345,6 +431,30 @@ impl Probes {
                             None
                         }
                     }
+                    EVENT_SOURCE_PROCFS => {
+                        if !has_procfs { return 0; }
+                        if data.len() >= procfs_event_size {
+                            ProcFsEvent::from_bytes(data).map(Event::ProcFs)
+                        } else {
+                            None
+                        }
+                    }
+                    EVENT_SOURCE_PROCNET => {
+                        if !has_procnet { return 0; }
+                        if data.len() >= procnet_event_size {
+                            ProcNetEvent::from_bytes(data).map(Event::ProcNet)
+                        } else {
+                            None
+                        }
+                    }
+                    EVENT_SOURCE_PROCSIG => {
+                        if !has_procsig { return 0; }
+                        if data.len() >= procsig_event_size {
+                            ProcSigEvent::from_bytes(data).map(Event::ProcSig)
+                        } else {
+                            None
+                        }
+                    }
                     _ => {
                         // Unknown source - ignore
                         log::warn!("probes: unknown event source {source}");
@@ -380,8 +490,44 @@ impl Probes {
             })
             .context("failed to spawn poll thread")?;
 
+        // Spawn flush thread for per-CPU aggregation maps (procnet/procsig).
+        // When re-enabling procfs write (#if 1 in procfs.bpf.c), restore:
+        //   let write_agg = self.procfs.as_ref().and_then(|p| p.write_agg_map_handle().ok());
+        //   if write_agg.is_some() || connect_agg... in the condition below, and
+        //   the flush_write_agg branch inside the loop (see block comment there).
+        let connect_agg = self.procnet.as_ref().and_then(|p| p.connect_agg_map_handle().ok());
+        let fork_agg = self.procsig.as_ref().and_then(|p| p.fork_agg_map_handle().ok());
+        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() {
+            let flush_tx = self.event_tx.clone();
+            let flush_stop = Arc::clone(&stop_flag);
+            let interval = Duration::from_millis(flush_interval_ms.max(1));
+            let h = thread::Builder::new()
+                .name("probes-flush".into())
+                .spawn(move || {
+                    while !flush_stop.load(Ordering::Relaxed) {
+                        thread::sleep(interval);
+                        /*
+                        if let Some(ref m) = write_agg {
+                            super::procfs::flush_write_agg(m, &flush_tx);
+                        }
+                        */
+                        if let Some(ref m) = connect_agg {
+                            super::procnet::flush_connect_agg(m, &flush_tx);
+                        }
+                        if let Some(ref m) = fork_agg {
+                            super::procsig::flush_fork_agg(m, &flush_tx);
+                        }
+                    }
+                })
+                .context("failed to spawn flush thread")?;
+            Some(h)
+        } else {
+            None
+        };
+
         Ok(ProbesPoller {
             handle: Some(handle),
+            flush_handle,
             stop_flag,
         })
     }
@@ -435,6 +581,7 @@ impl Probes {
 /// Poller handle for the unified ring buffer thread
 pub struct ProbesPoller {
     handle: Option<thread::JoinHandle<()>>,
+    flush_handle: Option<thread::JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -443,6 +590,9 @@ impl ProbesPoller {
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.flush_handle.take() {
             let _ = h.join();
         }
     }

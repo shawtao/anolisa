@@ -132,6 +132,9 @@ pub struct ProbeConfig {
     pub filewatch: bool,      // default: false
     pub filewrite: bool,      // default: true
     pub udpdns: Option<bool>, // None = auto (enable if domain_rules non-empty)
+    pub procfs: bool,         // default: false
+    pub procnet: bool,        // default: false
+    pub procsig: bool,        // default: false
 }
 
 impl Default for ProbeConfig {
@@ -142,6 +145,9 @@ impl Default for ProbeConfig {
             filewatch: false,
             filewrite: true,
             udpdns: None,
+            procfs: false,
+            procnet: false,
+            procsig: false,
         }
     }
 }
@@ -174,6 +180,8 @@ struct JsonFullConfig {
     cgroup_filter_enabled: Option<bool>,
     #[serde(default)]
     cgroup_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    proc_ext_flush_interval_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -188,6 +196,12 @@ struct JsonProbes {
     filewrite: Option<bool>,
     #[serde(default)]
     udpdns: Option<bool>,
+    #[serde(default)]
+    procfs: Option<bool>,
+    #[serde(default)]
+    procnet: Option<bool>,
+    #[serde(default)]
+    procsig: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -347,6 +361,11 @@ pub struct AgentsightConfig {
     /// `stat -c %i /sys/fs/cgroup/memory/<path>` (v1).
     pub cgroup_ids: Vec<u64>,
 
+    /// Flush interval (ms) for procfs/procnet/procsig BPF aggregation maps.
+    /// Controls how often the user-space flush thread drains percpu hash
+    /// aggregation maps and emits the consolidated events. Default: 500.
+    pub proc_ext_flush_interval_ms: u64,
+
     // --- HTTP/Aggregation Configuration ---
     /// LRU cache capacity for HTTP connections
     pub connection_capacity: usize,
@@ -404,6 +423,9 @@ impl Default for AgentsightConfig {
             probe_config: ProbeConfig::default(),
             cgroup_filter_enabled: false,
             cgroup_ids: Vec::new(),
+
+            // Proc extension probes flush interval (ms) for percpu hash maps
+            proc_ext_flush_interval_ms: 500,
 
             // HTTP/Aggregation defaults
             connection_capacity: DEFAULT_CONNECTION_CAPACITY,
@@ -563,6 +585,15 @@ impl AgentsightConfig {
             if let Some(v) = jp.udpdns {
                 pc.udpdns = Some(v);
             }
+            if let Some(v) = jp.procfs {
+                pc.procfs = v;
+            }
+            if let Some(v) = jp.procnet {
+                pc.procnet = v;
+            }
+            if let Some(v) = jp.procsig {
+                pc.procsig = v;
+            }
             self.probe_config = pc;
         }
 
@@ -575,6 +606,10 @@ impl AgentsightConfig {
         }
         if let Some(ids) = parsed.cgroup_ids.take() {
             self.cgroup_ids = ids;
+        }
+
+        if let Some(v) = parsed.proc_ext_flush_interval_ms {
+            self.proc_ext_flush_interval_ms = v;
         }
 
         let (cmdline_rules, domain_rules) = extract_rules(parsed);

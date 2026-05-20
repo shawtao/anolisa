@@ -57,7 +57,19 @@ fn main() {
     // Generate udpdns skeleton and bindings
     generate_skeleton(&mut out, "udpdns");
     generate_header(&mut out, "udpdns");
-    
+
+    // Generate procfs skeleton and bindings
+    generate_skeleton(&mut out, "procfs");
+    generate_header(&mut out, "procfs");
+
+    // Generate procnet skeleton and bindings
+    generate_skeleton(&mut out, "procnet");
+    generate_header(&mut out, "procnet");
+
+    // Generate procsig skeleton and bindings
+    generate_skeleton(&mut out, "procsig");
+    generate_header(&mut out, "procsig");
+
     // generate_header(&mut out, "frametypes");
     // generate_header(&mut out, "errors");
     // generate_header(&mut out, "stackdeltatypes");

@@ -4,6 +4,9 @@ use crate::probes::procmon::Event as ProcMonEvent;
 use crate::probes::filewatch::FileWatchEvent;
 use crate::probes::filewrite::FileWriteEvent;
 use crate::probes::udpdns::UdpDnsEvent;
+use crate::probes::procfs::ProcFsEvent;
+use crate::probes::procnet::ProcNetEvent;
+use crate::probes::procsig::ProcSigEvent;
 
 /// Unified event type that can represent any probe event
 ///
@@ -16,6 +19,9 @@ pub enum Event {
     FileWatch(FileWatchEvent),
     FileWrite(FileWriteEvent),
     UdpDns(UdpDnsEvent),
+    ProcFs(ProcFsEvent),
+    ProcNet(ProcNetEvent),
+    ProcSig(ProcSigEvent),
 }
 
 impl Event {
@@ -28,6 +34,9 @@ impl Event {
             Event::FileWatch(_) => "FileWatch",
             Event::FileWrite(_) => "FileWrite",
             Event::UdpDns(_) => "UdpDns",
+            Event::ProcFs(_) => "ProcFs",
+            Event::ProcNet(_) => "ProcNet",
+            Event::ProcSig(_) => "ProcSig",
         }
     }
 }
@@ -107,6 +116,45 @@ impl Event {
     pub fn as_udpdns(&self) -> Option<&UdpDnsEvent> {
         match self {
             Event::UdpDns(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a procfs event
+    pub fn is_procfs(&self) -> bool {
+        matches!(self, Event::ProcFs(_))
+    }
+
+    /// Check if this is a procnet event
+    pub fn is_procnet(&self) -> bool {
+        matches!(self, Event::ProcNet(_))
+    }
+
+    /// Check if this is a procsig event
+    pub fn is_procsig(&self) -> bool {
+        matches!(self, Event::ProcSig(_))
+    }
+
+    /// Get procfs event if this is one
+    pub fn as_procfs(&self) -> Option<&ProcFsEvent> {
+        match self {
+            Event::ProcFs(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Get procnet event if this is one
+    pub fn as_procnet(&self) -> Option<&ProcNetEvent> {
+        match self {
+            Event::ProcNet(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Get procsig event if this is one
+    pub fn as_procsig(&self) -> Option<&ProcSigEvent> {
+        match self {
+            Event::ProcSig(e) => Some(e),
             _ => None,
         }
     }

@@ -198,7 +198,7 @@ impl AgentSight {
         }
 
         // Start polling (non-blocking)
-        let _poller = probes.run().context("Failed to start probe poller")?;
+        let _poller = probes.run(config.proc_ext_flush_interval_ms).context("Failed to start probe poller")?;
 
         // Initialize unified storage based on config
         let storage = Self::create_storage(&config)?;
@@ -434,6 +434,34 @@ impl AgentSight {
                     log::warn!("[UDP-DNS] Failed to attach to pid={}: {}", dns_event.pid, e);
                 }
             }
+            return None;
+        }
+
+        // ProcFs / ProcNet / ProcSig events are not yet wired into the parser
+        // pipeline; emit a debug log and drop them so they remain observable
+        // via RUST_LOG=debug without affecting downstream stages.
+        if let Event::ProcFs(ref e) = event {
+            log::debug!(
+                "ProcFs: pid={} op={} path={} ret={} cgroup_id={} count={} total_bytes={}",
+                e.pid, e.op_name(), e.path, e.ret, e.cgroup_id, e.count, e.total_bytes
+            );
+            return None;
+        }
+        if let Event::ProcNet(ref e) = event {
+            use std::net::Ipv4Addr;
+            let dst_ip = Ipv4Addr::from(e.dst_addr.to_be());
+            let src_ip = Ipv4Addr::from(e.addr.to_be());
+            log::debug!(
+                "ProcNet: pid={} op={} src={}:{} dst={}:{} ret={} cgroup_id={} count={}",
+                e.pid, e.op_name(), src_ip, e.port, dst_ip, e.dst_port, e.ret, e.cgroup_id, e.count
+            );
+            return None;
+        }
+        if let Event::ProcSig(ref e) = event {
+            log::debug!(
+                "ProcSig: pid={} comm={} op={} target_pid={} signal={} ret={} cgroup_id={} count={}",
+                e.pid, e.comm, e.op_name(), e.target_pid, e.signal, e.ret, e.cgroup_id, e.count
+            );
             return None;
         }
 
