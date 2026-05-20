@@ -26,6 +26,8 @@
 
 pub mod probes;
 pub mod config;
+pub mod raw_event;
+pub mod enricher;
 
 // Re-export config types
 pub use config::{AgentsightConfig, ProbeConfig, default_base_path};

@@ -15,6 +15,7 @@ use include_dir::{include_dir, Dir};
 
 use crate::health::{HealthChecker, HealthStore};
 use crate::storage::sqlite::InterruptionStore;
+use crate::storage::RawEventsStore;
 
 /// Embedded frontend static files (built from dashboard/ via `npm run build:embed`)
 /// The directory `frontend-dist/` must exist at compile time; if it is absent
@@ -31,6 +32,8 @@ pub struct AppState {
     pub health_store: Arc<RwLock<HealthStore>>,
     /// Interruption events store
     pub interruption_store: Option<Arc<InterruptionStore>>,
+    /// Raw events store (read-only) for /api/raw-events* endpoints
+    pub raw_events_store: Option<Arc<RawEventsStore>>,
 }
 
 // ─── Static file handler ─────────────────────────────────────────────────────
@@ -90,7 +93,12 @@ fn mime_for_path(path: &str) -> &'static str {
 ///
 /// Binds to the given host:port and serves API endpoints + embedded frontend.
 /// This function blocks until the server is shut down.
-pub async fn run_server(host: &str, port: u16, storage_path: PathBuf) -> std::io::Result<()> {
+pub async fn run_server(
+    host: &str,
+    port: u16,
+    storage_path: PathBuf,
+    raw_events_db_path: Option<PathBuf>,
+) -> std::io::Result<()> {
     // Initialize GenAI SQLite store (needed for HealthChecker to query pending calls)
     let genai_store: Option<Arc<crate::storage::sqlite::GenAISqliteStore>> =
         match crate::storage::sqlite::GenAISqliteStore::new() {
@@ -123,6 +131,21 @@ pub async fn run_server(host: &str, port: u16, storage_path: PathBuf) -> std::io
         }
     };
 
+    // Initialize raw events store (read-only access for HTTP handlers)
+    let raw_events_store: Option<Arc<RawEventsStore>> = match raw_events_db_path {
+        Some(path) => match RawEventsStore::open(&path) {
+            Ok(store) => {
+                log::info!("Raw events store initialized at {:?}", path);
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                log::warn!("Failed to open raw events store at {:?}: {}", path, e);
+                None
+            }
+        },
+        None => None,
+    };
+
     // Spin up the background health checker
     let health_store = Arc::new(RwLock::new(HealthStore::new()));
     let mut checker = HealthChecker::new(Arc::clone(&health_store), Duration::from_secs(30));
@@ -139,6 +162,7 @@ pub async fn run_server(host: &str, port: u16, storage_path: PathBuf) -> std::io
         start_time: Instant::now(),
         health_store,
         interruption_store,
+        raw_events_store,
     });
 
     let has_frontend = FRONTEND.get_file("index.html").is_some();
@@ -193,6 +217,13 @@ pub async fn run_server(host: &str, port: u16, storage_path: PathBuf) -> std::io
             .service(handlers::skill_metrics_usage_ratio)
             .service(handlers::skill_metrics_distribution)
             .service(handlers::skill_metrics_hotness)
+            // Raw events API routes
+            .service(handlers::raw_events_since)
+            .service(handlers::raw_events_tree)
+            .service(handlers::raw_events_window)
+            .service(handlers::raw_events_by_cgroup)
+            .service(handlers::raw_events_summary)
+            .service(handlers::raw_events_stats)
             // Frontend static files (catch-all, must be last)
             .service(serve_frontend)
     })

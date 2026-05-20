@@ -1269,3 +1269,218 @@ fn compute_skill_metrics_response(
     let report = crate::skill_metrics::compute_skill_metrics(&events, &options);
     HttpResponse::Ok().json(report)
 }
+
+// ─── Raw events endpoints ────────────────────────────────────────────────────
+
+/// Query parameters for /api/raw-events
+#[derive(Debug, Deserialize)]
+pub struct RawEventsSinceQuery {
+    pub since_id: Option<i64>,
+    pub limit: Option<u32>,
+    pub source: Option<String>,
+    pub pid: Option<u32>,
+}
+
+/// GET /api/raw-events?since_id=<i64>&limit=<u32>&source=<str>&pid=<u32>
+///
+/// Incremental pull of raw events with `id > since_id`, optionally filtered by
+/// source and pid. `limit` is clamped to [1, 1000] (default 100).
+#[get("/api/raw-events")]
+pub async fn raw_events_since(
+    data: web::Data<AppState>,
+    query: web::Query<RawEventsSinceQuery>,
+) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    let since_id = query.since_id.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let source = query.source.as_deref();
+    let pid = query.pid;
+
+    let events = store.query_since(since_id, limit, source, pid);
+    let next_since_id = events
+        .iter()
+        .filter_map(|e| e.id)
+        .max()
+        .unwrap_or(since_id);
+    let total_in_db = store.total_count();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "events": events,
+        "next_since_id": next_since_id,
+        "total_in_db": total_in_db,
+    }))
+}
+
+/// Query parameters for /api/raw-events/tree
+#[derive(Debug, Deserialize)]
+pub struct RawEventsTreeQuery {
+    pub pid: u32,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+/// GET /api/raw-events/tree?pid=<u32>&from=<i64>&to=<i64>
+///
+/// Returns events for `pid` and all descendant PIDs within the time window.
+/// Defaults: `from = 0`, `to = now`.
+#[get("/api/raw-events/tree")]
+pub async fn raw_events_tree(
+    data: web::Data<AppState>,
+    query: web::Query<RawEventsTreeQuery>,
+) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    let to = query.to.unwrap_or_else(|| now_ms() as i64);
+    let from = query.from.unwrap_or(0);
+
+    let events = store.query_tree(query.pid, from, to);
+    HttpResponse::Ok().json(serde_json::json!({ "events": events }))
+}
+
+/// Query parameters for /api/raw-events/window
+#[derive(Debug, Deserialize)]
+pub struct RawEventsWindowQuery {
+    pub from: i64,
+    pub to: i64,
+    pub source: Option<String>,
+}
+
+/// GET /api/raw-events/window?from=<i64>&to=<i64>&source=<str>
+///
+/// Returns events in `[from, to]` Unix-millisecond range, ordered by timestamp.
+#[get("/api/raw-events/window")]
+pub async fn raw_events_window(
+    data: web::Data<AppState>,
+    query: web::Query<RawEventsWindowQuery>,
+) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    let events = store.query_window(query.from, query.to, query.source.as_deref());
+    HttpResponse::Ok().json(serde_json::json!({ "events": events }))
+}
+
+/// GET /api/raw-events/stats
+///
+/// Returns aggregate statistics over the entire `raw_events` table.
+#[get("/api/raw-events/stats")]
+pub async fn raw_events_stats(data: web::Data<AppState>) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    let stats = store.stats();
+    HttpResponse::Ok().json(serde_json::json!({
+        "total": stats.total,
+        "by_source": stats.by_source,
+        "oldest_ms": stats.oldest_ms,
+        "newest_ms": stats.newest_ms,
+    }))
+}
+
+/// Query parameters for /api/raw-events/by-cgroup
+#[derive(Debug, Deserialize)]
+pub struct RawEventsByCgroupQuery {
+    pub cgroup_id: u64,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub source: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// GET /api/raw-events/by-cgroup?cgroup_id=<u64>&from_ms=<i64>&to_ms=<i64>&source=<str>&limit=<u32>
+///
+/// Container-dimension query: returns events for a given `cgroup_id` within
+/// `[from_ms, to_ms]`, optionally filtered by `source`. `limit` defaults to
+/// 1000 and is clamped to [1, 10000].
+#[get("/api/raw-events/by-cgroup")]
+pub async fn raw_events_by_cgroup(
+    data: web::Data<AppState>,
+    query: web::Query<RawEventsByCgroupQuery>,
+) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    let limit = query.limit.unwrap_or(1000).clamp(1, 10000);
+    let source = query.source.as_deref();
+
+    let events = store.query_by_cgroup(
+        query.cgroup_id,
+        query.from_ms,
+        query.to_ms,
+        source,
+        limit,
+    );
+    let count = events.len();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "events": events,
+        "count": count,
+    }))
+}
+
+/// Query parameters for /api/raw-events/summary
+#[derive(Debug, Deserialize)]
+pub struct RawEventsSummaryQuery {
+    pub pid: Option<u32>,
+    pub cgroup_id: Option<u64>,
+    pub from_ms: i64,
+    pub to_ms: i64,
+}
+
+/// GET /api/raw-events/summary?pid=<u32>&cgroup_id=<u64>&from_ms=<i64>&to_ms=<i64>
+///
+/// Behaviour-summary aggregation: returns a `{source: {op: total_count}}` map
+/// for events in `[from_ms, to_ms]` matching the given `pid` and/or `cgroup_id`.
+/// At least one of `pid` / `cgroup_id` must be supplied; otherwise the request
+/// is rejected with HTTP 400.
+#[get("/api/raw-events/summary")]
+pub async fn raw_events_summary(
+    data: web::Data<AppState>,
+    query: web::Query<RawEventsSummaryQuery>,
+) -> impl Responder {
+    let Some(ref store) = data.raw_events_store else {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Raw events store not initialized"}));
+    };
+
+    if query.pid.is_none() && query.cgroup_id.is_none() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "at least one of `pid` or `cgroup_id` must be provided"
+        }));
+    }
+
+    let summary = store.query_summary(
+        query.pid,
+        query.cgroup_id,
+        query.from_ms,
+        query.to_ms,
+    );
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "summary": summary,
+        "from_ms": query.from_ms,
+        "to_ms": query.to_ms,
+    }))
+}
+
+/// Current UNIX time in milliseconds
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

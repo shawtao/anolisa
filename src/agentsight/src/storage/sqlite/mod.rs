@@ -12,6 +12,7 @@ pub mod connection;
 pub mod genai;
 pub mod http;
 pub mod interruption;
+pub mod raw_events;
 pub mod token;
 pub mod token_consumption;
 pub mod tokenless;
@@ -48,3 +49,6 @@ pub use connection::{create_connection, default_base_path};
 
 // Re-export tokenless stats storage
 pub use tokenless::TokenlessStatsStore;
+
+// Re-export raw events storage
+pub use raw_events::{RawEventsStore, RawEventSender, spawn_batch_writer, spawn_ttl_reaper, RawEventStats};

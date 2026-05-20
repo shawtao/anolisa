@@ -593,14 +593,61 @@ pub unsafe extern "C" fn agentsight_start(h: *mut AgentsightHandle) -> c_int {
 /// This function creates AgentSight *inside* the thread to avoid `Send`
 /// constraints on eBPF objects.
 fn ffi_background_thread(
-    config: AgentsightConfig,
+    mut config: AgentsightConfig,
     tx: mpsc::Sender<FfiEvent>,
     eventfd: i32,
     running: Arc<AtomicBool>,
 ) {
     let sender = FfiEventSender { tx, eventfd };
 
-    let mut sight = match AgentSight::new(config) {
+    // Pre-load config file (if any) so raw-events flags are visible before
+    // AgentSight::new() consumes the config. AgentSight::new() reloads as well;
+    // load_from_file is idempotent for the raw_events_* fields.
+    if let Some(path) = config.config_path.clone() {
+        if path.exists() {
+            if let Err(e) = config.load_from_file(&path) {
+                log::warn!("ffi: failed to pre-load config {:?}: {}", path, e);
+            }
+        }
+    }
+
+    // Initialize the raw events channel when enabled by config.
+    let raw_event_sender = if config.raw_events_enabled {
+        let db_path = if config.raw_events_db_path.as_os_str().is_empty() {
+            config.storage_base_path.join("raw_events.db")
+        } else {
+            config.raw_events_db_path.clone()
+        };
+
+        match crate::storage::spawn_batch_writer(
+            &db_path,
+            config.raw_events_batch_size,
+            config.raw_events_batch_interval_ms,
+            config.raw_events_max_buf,
+        ) {
+            Ok(s) => {
+                log::info!("raw_events batch writer started at {:?}", db_path);
+                if let Err(e) = crate::storage::spawn_ttl_reaper(
+                    &db_path,
+                    config.raw_events_ttl_secs,
+                ) {
+                    log::warn!("raw_events ttl reaper failed to start: {}", e);
+                }
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!(
+                    "raw_events batch writer failed to start at {:?}: {}",
+                    db_path, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut sight = match AgentSight::new(config, raw_event_sender) {
         Ok(s) => s,
         Err(e) => {
             log::error!("agentsight background thread: AgentSight::new failed: {}", e);

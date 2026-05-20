@@ -24,6 +24,8 @@ pub use sqlite::{
     HttpStore,
     // Connection utilities
     create_connection, default_base_path,
+    // Raw events storage
+    RawEventsStore, RawEventSender, spawn_batch_writer, spawn_ttl_reaper, RawEventStats,
 };
 
 // Re-export unified storage

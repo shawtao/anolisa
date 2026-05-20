@@ -69,10 +69,52 @@ impl TraceCommand {
             .override_filewatch(self.enable_filewatch);
 
         // Set config_path for unified loading in AgentSight::new()
-        let config = config.set_config_path(std::path::PathBuf::from(&self.config));
-        
+        let mut config = config.set_config_path(std::path::PathBuf::from(&self.config));
+
+        // Load config file early so the raw-events flags below see real values.
+        if let Some(path) = config.config_path.clone() {
+            if path.exists() {
+                if let Err(e) = config.load_from_file(&path) {
+                    log::warn!("trace: failed to pre-load config {:?}: {}", path, e);
+                }
+            }
+        }
+
+        // Initialize the raw events channel when enabled by config.
+        let raw_event_sender = if config.raw_events_enabled {
+            let db_path = if config.raw_events_db_path.as_os_str().is_empty() {
+                config.storage_base_path.join("raw_events.db")
+            } else {
+                config.raw_events_db_path.clone()
+            };
+
+            match agentsight::storage::spawn_batch_writer(
+                &db_path,
+                config.raw_events_batch_size,
+                config.raw_events_batch_interval_ms,
+                config.raw_events_max_buf,
+            ) {
+                Ok(sender) => {
+                    log::info!("raw_events batch writer started at {:?}", db_path);
+                    if let Err(e) = agentsight::storage::spawn_ttl_reaper(
+                        &db_path,
+                        config.raw_events_ttl_secs,
+                    ) {
+                        log::warn!("raw_events ttl reaper failed to start: {}", e);
+                    }
+                    Some(sender)
+                }
+                Err(e) => {
+                    log::warn!("raw_events batch writer failed to start at {:?}: {}", db_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Create AgentSight (auto-attaches probes and starts polling)
-        let mut sight = match AgentSight::new(config) {
+        let mut sight = match AgentSight::new(config, raw_event_sender) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Failed to create AgentSight: {}", e);

@@ -366,6 +366,22 @@ pub struct AgentsightConfig {
     /// aggregation maps and emits the consolidated events. Default: 500.
     pub proc_ext_flush_interval_ms: u64,
 
+    // --- Raw Event Storage Configuration ---
+    /// Whether to enable raw event storage channel (writes to raw_events.db)
+    pub raw_events_enabled: bool,
+    /// Path to raw_events.db; defaults to storage_base_path/raw_events.db at runtime
+    pub raw_events_db_path: PathBuf,
+    /// Raw events TTL in seconds. Default: 86400 (24h)
+    pub raw_events_ttl_secs: u64,
+    /// BatchWriter max events per batch. Default: 512
+    pub raw_events_batch_size: usize,
+    /// BatchWriter flush interval in milliseconds. Default: 200
+    pub raw_events_batch_interval_ms: u64,
+    /// BatchWriter in-memory ring buffer max entries. Default: 16384
+    pub raw_events_max_buf: usize,
+    /// Whether to enable audit storage (agentsight.db). Default: true
+    pub enable_audit_storage: bool,
+
     // --- HTTP/Aggregation Configuration ---
     /// LRU cache capacity for HTTP connections
     pub connection_capacity: usize,
@@ -426,6 +442,15 @@ impl Default for AgentsightConfig {
 
             // Proc extension probes flush interval (ms) for percpu hash maps
             proc_ext_flush_interval_ms: 500,
+
+            // Raw event storage defaults
+            raw_events_enabled: false,
+            raw_events_db_path: PathBuf::new(),
+            raw_events_ttl_secs: 86400,
+            raw_events_batch_size: 512,
+            raw_events_batch_interval_ms: 200,
+            raw_events_max_buf: 16384,
+            enable_audit_storage: true,
 
             // HTTP/Aggregation defaults
             connection_capacity: DEFAULT_CONNECTION_CAPACITY,
@@ -610,6 +635,31 @@ impl AgentsightConfig {
 
         if let Some(v) = parsed.proc_ext_flush_interval_ms {
             self.proc_ext_flush_interval_ms = v;
+        }
+
+        // Raw event storage configuration
+        if let Some(obj) = serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.as_object().cloned()) {
+            if let Some(v) = obj.get("raw_events_enabled").and_then(|v| v.as_bool()) {
+                self.raw_events_enabled = v;
+            }
+            if let Some(v) = obj.get("raw_events_db_path").and_then(|v| v.as_str()) {
+                self.raw_events_db_path = PathBuf::from(v);
+            }
+            if let Some(v) = obj.get("raw_events_ttl_secs").and_then(|v| v.as_u64()) {
+                self.raw_events_ttl_secs = v;
+            }
+            if let Some(v) = obj.get("raw_events_batch_size").and_then(|v| v.as_u64()) {
+                self.raw_events_batch_size = v as usize;
+            }
+            if let Some(v) = obj.get("raw_events_batch_interval_ms").and_then(|v| v.as_u64()) {
+                self.raw_events_batch_interval_ms = v;
+            }
+            if let Some(v) = obj.get("raw_events_max_buf").and_then(|v| v.as_u64()) {
+                self.raw_events_max_buf = v as usize;
+            }
+            if let Some(v) = obj.get("enable_audit_storage").and_then(|v| v.as_bool()) {
+                self.enable_audit_storage = v;
+            }
         }
 
         let (cmdline_rules, domain_rules) = extract_rules(parsed);

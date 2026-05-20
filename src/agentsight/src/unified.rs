@@ -93,6 +93,10 @@ pub struct AgentSight {
     last_drain_check: std::time::Instant,
     /// Cache of pid → agent_name, persists after process exit for deferred resolution
     pid_agent_name_cache: HashMap<u32, String>,
+    /// Optional raw event sender for fan-out to raw_events.db
+    raw_event_sender: Option<crate::storage::RawEventSender>,
+    /// PID → parent info enrichment table
+    pid_table: crate::enricher::PidTable,
 }
 
 /// GenAI events waiting for session_id resolution via ResponseSessionMapper.
@@ -120,7 +124,7 @@ impl AgentSight {
     /// let config = AgentsightConfig::new();
     /// let mut sight = AgentSight::new(config)?;
     /// ```
-    pub fn new(mut config: AgentsightConfig) -> Result<Self> {
+    pub fn new(mut config: AgentsightConfig, raw_event_sender: Option<crate::storage::RawEventSender>) -> Result<Self> {
         config.apply_verbose();
 
         // Load rules from config file only when config_path is set (CLI --config)
@@ -331,6 +335,8 @@ impl AgentSight {
             ffi_sender: None,
             last_drain_check: std::time::Instant::now(),
             pid_agent_name_cache,
+            raw_event_sender,
+            pid_table: crate::enricher::PidTable::new(),
         })
     }
 
@@ -411,12 +417,22 @@ impl AgentSight {
         // Handle FileWatch events via callback (not through the pipeline)
         if let Event::FileWatch(ref fw_event) = event {
             self.handle_filewatch_event(fw_event);
+            if let Some(ref sender) = self.raw_event_sender {
+                let ppid = self.pid_table.lookup_ppid(fw_event.pid);
+                let raw = crate::raw_event::RawEvent::from_filewatch(fw_event, ppid);
+                sender.try_send(raw);
+            }
             return None;
         }
 
         // Handle FileWrite events via callback (not through the pipeline)
         if let Event::FileWrite(ref fw_event) = event {
             self.handle_filewrite_event(fw_event);
+            if let Some(ref sender) = self.raw_event_sender {
+                let ppid = self.pid_table.lookup_ppid(fw_event.pid);
+                let raw = crate::raw_event::RawEvent::from_filewrite(fw_event, ppid);
+                sender.try_send(raw);
+            }
             // After mapper is updated, try to resolve any pending GenAI events
             self.resolve_pending_genai();
             return None;
@@ -437,14 +453,18 @@ impl AgentSight {
             return None;
         }
 
-        // ProcFs / ProcNet / ProcSig events are not yet wired into the parser
-        // pipeline; emit a debug log and drop them so they remain observable
-        // via RUST_LOG=debug without affecting downstream stages.
+        // ProcFs / ProcNet / ProcSig events: emit debug log and fan-out to
+        // the raw_events channel when enabled, then drop (not in parser pipeline).
         if let Event::ProcFs(ref e) = event {
             log::debug!(
                 "ProcFs: pid={} op={} path={} ret={} cgroup_id={} count={} total_bytes={}",
                 e.pid, e.op_name(), e.path, e.ret, e.cgroup_id, e.count, e.total_bytes
             );
+            if let Some(ref sender) = self.raw_event_sender {
+                let ppid = self.pid_table.lookup_ppid(e.pid);
+                let raw = crate::raw_event::RawEvent::from_procfs(e, ppid);
+                sender.try_send(raw);
+            }
             return None;
         }
         if let Event::ProcNet(ref e) = event {
@@ -455,6 +475,11 @@ impl AgentSight {
                 "ProcNet: pid={} op={} src={}:{} dst={}:{} ret={} cgroup_id={} count={}",
                 e.pid, e.op_name(), src_ip, e.port, dst_ip, e.dst_port, e.ret, e.cgroup_id, e.count
             );
+            if let Some(ref sender) = self.raw_event_sender {
+                let ppid = self.pid_table.lookup_ppid(e.pid);
+                let raw = crate::raw_event::RawEvent::from_procnet(e, ppid);
+                sender.try_send(raw);
+            }
             return None;
         }
         if let Event::ProcSig(ref e) = event {
@@ -462,7 +487,57 @@ impl AgentSight {
                 "ProcSig: pid={} comm={} op={} target_pid={} signal={} ret={} cgroup_id={} count={}",
                 e.pid, e.comm, e.op_name(), e.target_pid, e.signal, e.ret, e.cgroup_id, e.count
             );
+            if let Some(ref sender) = self.raw_event_sender {
+                let ppid = self.pid_table.lookup_ppid(e.pid);
+                let raw = crate::raw_event::RawEvent::from_procsig(e, ppid);
+                sender.try_send(raw);
+            }
             return None;
+        }
+
+        // ProcTrace exec/exit fan-out to raw channel + PidTable update.
+        // This runs BEFORE parse_event so that PidTable is populated for
+        // subsequent events. The Proc event continues through the normal
+        // parser → aggregator → analyzer pipeline afterwards.
+        if let Event::Proc(ref proc_event) = event {
+            use crate::probes::proctrace::VariableEvent;
+            match proc_event {
+                VariableEvent::Exec { header, filename, args } => {
+                    // Update PidTable from exec event
+                    let comm = {
+                        let bytes: Vec<u8> = header.comm.iter()
+                            .map(|&c| c as u8)
+                            .take_while(|&b| b != 0)
+                            .collect();
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    };
+                    self.pid_table.update_from_exec(
+                        header.pid, header.ppid, &comm,
+                        header.cgroup_id, header.timestamp_ns,
+                    );
+                    // Fan-out to raw channel
+                    if let Some(ref sender) = self.raw_event_sender {
+                        let raw = crate::raw_event::RawEvent::from_proctrace_exec(
+                            header, filename, args, header.ppid,
+                        );
+                        sender.try_send(raw);
+                    }
+                }
+                VariableEvent::Exit { header, exit_code } => {
+                    if let Some(ref sender) = self.raw_event_sender {
+                        // Prefer PidTable ppid (populated from exec); fall back to BPF header.
+                        let ppid = {
+                            let table_ppid = self.pid_table.lookup_ppid(header.pid);
+                            if table_ppid != 0 { table_ppid } else { header.ppid }
+                        };
+                        let raw = crate::raw_event::RawEvent::from_proctrace_exit(
+                            header, *exit_code, ppid,
+                        );
+                        sender.try_send(raw);
+                    }
+                }
+                _ => {} // Stdout / Unknown — no raw event fan-out
+            }
         }
 
         // Parse the event
