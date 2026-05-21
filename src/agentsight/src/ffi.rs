@@ -27,6 +27,7 @@ use crate::unified::AgentSight;
 pub(crate) enum FfiEvent {
     Https(HttpRecord),
     Llm(LLMCall),
+    Raw(crate::raw_event::RawEvent),
 }
 
 /// Wraps an `mpsc::Sender<FfiEvent>` together with the `eventfd` descriptor
@@ -41,6 +42,24 @@ impl FfiEventSender {
     pub fn send(&self, event: FfiEvent) {
         if self.tx.send(event).is_ok() {
             // Write 1 to the eventfd counter to wake up the consumer.
+            let val: u64 = 1;
+            unsafe {
+                libc::write(self.eventfd, &val as *const u64 as *const c_void, 8);
+            }
+        }
+    }
+}
+
+/// Sender for raw events destined for the FFI raw callback channel.
+/// Independent from the GenAI/HTTP FfiEventSender.
+pub(crate) struct RawFfiSender {
+    tx: mpsc::Sender<crate::raw_event::RawEvent>,
+    eventfd: i32,
+}
+
+impl RawFfiSender {
+    pub fn try_send(&self, event: crate::raw_event::RawEvent) {
+        if self.tx.send(event).is_ok() {
             let val: u64 = 1;
             unsafe {
                 libc::write(self.eventfd, &val as *const u64 as *const c_void, 8);
@@ -116,6 +135,25 @@ pub struct AgentsightHttpsData {
     pub response_body_len: u32,
 }
 
+/// Raw event data passed to the FFI raw event callback.
+/// All pointers are valid ONLY for the duration of the callback invocation.
+#[repr(C)]
+pub struct AgentsightRawEventData {
+    pub timestamp_ms: u64,
+    pub source: *const c_char,
+    pub pid: u32,
+    pub ppid: u32,
+    pub tid: u32,
+    pub uid: u32,
+    pub comm: [c_char; 16],
+    pub cgroup_id: u64,
+    pub op: *const c_char,
+    pub ret: i32,
+    pub data_json: *const c_char,
+    pub data_json_len: u32,
+    pub count: u32,
+}
+
 /// LLM semantic layer data — only when the HTTP traffic is recognised as
 /// an LLM API call.
 #[repr(C)]
@@ -166,6 +204,10 @@ pub struct AgentsightHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Config stored until `agentsight_start()` moves it into the thread.
     config: Option<AgentsightConfig>,
+    // --- Raw event independent channel ---
+    raw_rx: mpsc::Receiver<crate::raw_event::RawEvent>,
+    raw_tx: Option<mpsc::Sender<crate::raw_event::RawEvent>>,
+    raw_eventfd: i32,
 }
 
 // ===========================================================================
@@ -174,9 +216,13 @@ pub struct AgentsightHandle {
 
 type HttpsCallbackFn = Option<unsafe extern "C" fn(*const AgentsightHttpsData, *mut c_void)>;
 type LlmCallbackFn = Option<unsafe extern "C" fn(*const AgentsightLLMData, *mut c_void)>;
+type RawEventCallbackFn = Option<unsafe extern "C" fn(*const AgentsightRawEventData, *mut c_void)>;
 
 /// Flag for `agentsight_read()`: block until at least one event is available.
 pub const AGENTSIGHT_READ_BLOCK: c_int = 1;
+
+/// Flag for `agentsight_read_raw()`: block until at least one raw event is available.
+pub const AGENTSIGHT_READ_RAW_BLOCK: c_int = 1;
 
 // ===========================================================================
 // Temporary data holders (keep CStrings alive during callbacks)
@@ -368,6 +414,9 @@ unsafe fn dispatch_event(
                 unsafe { cb(&holder.c_data, llm_ud) };
             }
         }
+        FfiEvent::Raw(_) => {
+            // Raw events are delivered via the independent agentsight_read_raw channel.
+        }
     }
 }
 
@@ -533,6 +582,14 @@ pub unsafe extern "C" fn agentsight_new(
         return ptr::null_mut();
     }
 
+    // Create raw eventfd
+    let raw_efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if raw_efd < 0 {
+        set_last_error("Failed to create raw eventfd");
+        unsafe { libc::close(efd) };
+        return ptr::null_mut();
+    }
+
     let config = if cfg.is_null() {
         AgentsightConfig::default()
     } else {
@@ -540,6 +597,7 @@ pub unsafe extern "C" fn agentsight_new(
     };
 
     let (tx, rx) = mpsc::channel();
+    let (raw_tx, raw_rx) = mpsc::channel();
     let running = Arc::new(AtomicBool::new(false));
 
     Box::into_raw(Box::new(AgentsightHandle {
@@ -549,6 +607,9 @@ pub unsafe extern "C" fn agentsight_new(
         running,
         thread: None,
         config: Some(config),
+        raw_rx,
+        raw_tx: Some(raw_tx),
+        raw_eventfd: raw_efd,
     }))
 }
 
@@ -577,12 +638,15 @@ pub unsafe extern "C" fn agentsight_start(h: *mut AgentsightHandle) -> c_int {
         }
     };
 
+    let raw_tx = handle.raw_tx.take();
+    let raw_efd = handle.raw_eventfd;
+
     let running = handle.running.clone();
     running.store(true, Ordering::SeqCst);
     let eventfd = handle.eventfd;
 
     handle.thread = Some(std::thread::spawn(move || {
-        ffi_background_thread(config, tx, eventfd, running);
+        ffi_background_thread(config, tx, eventfd, running, raw_tx, raw_efd);
     }));
 
     0
@@ -597,6 +661,8 @@ fn ffi_background_thread(
     tx: mpsc::Sender<FfiEvent>,
     eventfd: i32,
     running: Arc<AtomicBool>,
+    raw_tx: Option<mpsc::Sender<crate::raw_event::RawEvent>>,
+    raw_eventfd: i32,
 ) {
     let sender = FfiEventSender { tx, eventfd };
 
@@ -647,6 +713,9 @@ fn ffi_background_thread(
         None
     };
 
+    // Capture config flags before moving config into AgentSight::new().
+    let raw_events_ffi_enabled = config.raw_events_ffi;
+
     let mut sight = match AgentSight::new(config, raw_event_sender) {
         Ok(s) => s,
         Err(e) => {
@@ -657,6 +726,14 @@ fn ffi_background_thread(
 
     // Install FFI event sender on the AgentSight instance.
     sight.set_ffi_sender(sender);
+
+    // Install raw FFI sender when enabled by config.
+    if raw_events_ffi_enabled {
+        if let Some(rtx) = raw_tx {
+            let raw_sender = RawFfiSender { tx: rtx, eventfd: raw_eventfd };
+            sight.set_raw_ffi_sender(raw_sender);
+        }
+    }
 
     // Event loop controlled by the external running flag.
     while running.load(Ordering::SeqCst) {
@@ -703,6 +780,11 @@ impl Drop for AgentsightHandle {
         if self.eventfd >= 0 {
             unsafe { libc::close(self.eventfd) };
             self.eventfd = -1;
+        }
+        // Close the raw eventfd.
+        if self.raw_eventfd >= 0 {
+            unsafe { libc::close(self.raw_eventfd) };
+            self.raw_eventfd = -1;
         }
         // Join the background thread if still running.
         if let Some(th) = self.thread.take() {
@@ -776,6 +858,131 @@ pub unsafe extern "C" fn agentsight_read(
 
     // Drain the eventfd counter to prevent stale wakeups.
     drain_eventfd(handle.eventfd);
+
+    count
+}
+
+// ---- Raw event configuration ----
+
+/// Enable or disable raw event FFI delivery.
+/// Must be called before `agentsight_start()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_config_set_raw_events_ffi(
+    cfg: *mut AgentsightConfigHandle,
+    enable: c_int,
+) {
+    if !cfg.is_null() {
+        unsafe { (*cfg).raw_events_ffi = enable != 0 };
+    }
+}
+
+/// Enable or disable raw event storage (SQLite).
+/// Must be called before `agentsight_start()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_config_set_raw_events(
+    cfg: *mut AgentsightConfigHandle,
+    enable: c_int,
+) {
+    if !cfg.is_null() {
+        unsafe { (*cfg).raw_events_enabled = enable != 0 };
+    }
+}
+
+// ---- Raw event notification ----
+
+/// Return the eventfd descriptor for raw events.
+/// The caller may register it with epoll/select alongside the main eventfd.
+/// Returns <0 if raw events FFI is not enabled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_get_raw_eventfd(h: *mut AgentsightHandle) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    unsafe { (*h).raw_eventfd }
+}
+
+// ---- Raw event reading ----
+
+struct RawEventDataHolder {
+    c_data: AgentsightRawEventData,
+    _source: CString,
+    _op: CString,
+    _data_json: CString,
+}
+
+fn build_raw_event_data(raw: &crate::raw_event::RawEvent) -> RawEventDataHolder {
+    let source = safe_cstring(&raw.source);
+    let op = safe_cstring(&raw.op);
+    let data_json = safe_cstring(&raw.data_json);
+
+    let c_data = AgentsightRawEventData {
+        timestamp_ms: raw.timestamp_ms as u64,
+        source: source.as_ptr(),
+        pid: raw.pid,
+        ppid: raw.ppid,
+        tid: raw.tid,
+        uid: raw.uid,
+        comm: copy_process_name(&raw.comm),
+        cgroup_id: raw.cgroup_id,
+        op: op.as_ptr(),
+        ret: raw.ret,
+        data_json: data_json.as_ptr(),
+        data_json_len: raw.data_json.len() as u32,
+        count: raw.count as u32,
+    };
+
+    RawEventDataHolder {
+        c_data,
+        _source: source,
+        _op: op,
+        _data_json: data_json,
+    }
+}
+
+/// Process available raw events via callback.
+///
+/// * `raw_cb`: callback for raw events (NULL = drain without invoking).
+/// * `flags`: 0 = non-blocking, `AGENTSIGHT_READ_RAW_BLOCK` = block until ≥1 event.
+///
+/// Returns the number of events processed, 0 if none, <0 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_read_raw(
+    h: *mut AgentsightHandle,
+    raw_cb: RawEventCallbackFn,
+    raw_ud: *mut c_void,
+    flags: c_int,
+) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    let mut count: c_int = 0;
+
+    // Blocking mode: wait for at least one event.
+    if flags & AGENTSIGHT_READ_RAW_BLOCK != 0 {
+        match handle.raw_rx.recv() {
+            Ok(event) => {
+                if let Some(cb) = raw_cb {
+                    let holder = build_raw_event_data(&event);
+                    unsafe { cb(&holder.c_data, raw_ud) };
+                }
+                count += 1;
+            }
+            Err(_) => return -1,
+        }
+    }
+
+    // Non-blocking drain of remaining (or all) events.
+    while let Ok(event) = handle.raw_rx.try_recv() {
+        if let Some(cb) = raw_cb {
+            let holder = build_raw_event_data(&event);
+            unsafe { cb(&holder.c_data, raw_ud) };
+        }
+        count += 1;
+    }
+
+    // Drain the raw eventfd counter.
+    drain_eventfd(handle.raw_eventfd);
 
     count
 }

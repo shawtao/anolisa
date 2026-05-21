@@ -52,6 +52,23 @@ int agentsight_read(AgentsightHandle *h,
                     agentsight_https_callback_fn http_cb, void *http_ud,
                     agentsight_llm_callback_fn   llm_cb,  void *llm_ud,
                     int flags);
+
+/* ---- Raw event callback type ---- */
+typedef struct AgentsightRawEventData AgentsightRawEventData;
+typedef void (*agentsight_raw_event_callback_fn)(const AgentsightRawEventData *data, void *user_data);
+
+/* ---- Raw event configuration ---- */
+void agentsight_config_set_raw_events(AgentsightConfigHandle *cfg, int enable);
+void agentsight_config_set_raw_events_ffi(AgentsightConfigHandle *cfg, int enable);
+
+/* ---- Raw event notification ---- */
+int agentsight_get_raw_eventfd(AgentsightHandle *h);
+
+/* ---- Raw event reading ---- */
+#define AGENTSIGHT_READ_RAW_BLOCK 1
+int agentsight_read_raw(AgentsightHandle *h,
+                        agentsight_raw_event_callback_fn raw_cb, void *raw_ud,
+                        int flags);
 """
 
 [parse]
@@ -62,6 +79,7 @@ exclude = ["skill_metrics"]
 include = [
     "AgentsightHttpsData",
     "AgentsightLLMData",
+    "AgentsightRawEventData",
 ]
 # Only export structs — constants and functions are in after_includes
 item_types = ["structs"]

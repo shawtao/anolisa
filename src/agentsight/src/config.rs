@@ -379,6 +379,12 @@ pub struct AgentsightConfig {
     pub raw_events_batch_interval_ms: u64,
     /// BatchWriter in-memory ring buffer max entries. Default: 16384
     pub raw_events_max_buf: usize,
+    /// Whether to enable raw event FFI delivery (via agentsight_read_raw callback).
+    /// Default: false. When true, raw events are also pushed to an independent FFI channel.
+    pub raw_events_ffi: bool,
+    /// Max capacity of the FFI raw event ring buffer. Default: 16384.
+    /// When full, oldest events are dropped silently.
+    pub ffi_raw_max_buf: usize,
     /// Whether to enable audit storage (agentsight.db). Default: true
     pub enable_audit_storage: bool,
 
@@ -450,6 +456,8 @@ impl Default for AgentsightConfig {
             raw_events_batch_size: 512,
             raw_events_batch_interval_ms: 200,
             raw_events_max_buf: 16384,
+            raw_events_ffi: false,
+            ffi_raw_max_buf: 16384,
             enable_audit_storage: true,
 
             // HTTP/Aggregation defaults
@@ -656,6 +664,12 @@ impl AgentsightConfig {
             }
             if let Some(v) = obj.get("raw_events_max_buf").and_then(|v| v.as_u64()) {
                 self.raw_events_max_buf = v as usize;
+            }
+            if let Some(v) = obj.get("raw_events_ffi").and_then(|v| v.as_bool()) {
+                self.raw_events_ffi = v;
+            }
+            if let Some(v) = obj.get("ffi_raw_max_buf").and_then(|v| v.as_u64()) {
+                self.ffi_raw_max_buf = v as usize;
             }
             if let Some(v) = obj.get("enable_audit_storage").and_then(|v| v.as_bool()) {
                 self.enable_audit_storage = v;

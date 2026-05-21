@@ -29,7 +29,7 @@ use crate::analyzer::Analyzer;
 use crate::config::AgentsightConfig;
 use crate::discovery::AgentScanner;
 use crate::event::Event;
-use crate::ffi::{FfiEvent, FfiEventSender};
+use crate::ffi::{FfiEvent, FfiEventSender, RawFfiSender};
 use crate::genai::{GenAIBuilder, GenAIExporter, GenAIStore, LogtailExporter};
 use crate::genai::semantic::GenAISemanticEvent;
 use crate::interruption::{InterruptionDetector, DetectorConfig};
@@ -95,6 +95,8 @@ pub struct AgentSight {
     pid_agent_name_cache: HashMap<u32, String>,
     /// Optional raw event sender for fan-out to raw_events.db
     raw_event_sender: Option<crate::storage::RawEventSender>,
+    /// Optional raw FFI sender for raw event FFI delivery
+    raw_ffi_sender: Option<RawFfiSender>,
     /// PID → parent info enrichment table
     pid_table: crate::enricher::PidTable,
 }
@@ -336,6 +338,7 @@ impl AgentSight {
             last_drain_check: std::time::Instant::now(),
             pid_agent_name_cache,
             raw_event_sender,
+            raw_ffi_sender: None,
             pid_table: crate::enricher::PidTable::new(),
         })
     }
@@ -417,10 +420,10 @@ impl AgentSight {
         // Handle FileWatch events via callback (not through the pipeline)
         if let Event::FileWatch(ref fw_event) = event {
             self.handle_filewatch_event(fw_event);
-            if let Some(ref sender) = self.raw_event_sender {
+            if self.has_raw_sink() {
                 let ppid = self.pid_table.lookup_ppid(fw_event.pid);
                 let raw = crate::raw_event::RawEvent::from_filewatch(fw_event, ppid);
-                sender.try_send(raw);
+                self.fanout_raw(raw);
             }
             return None;
         }
@@ -428,10 +431,10 @@ impl AgentSight {
         // Handle FileWrite events via callback (not through the pipeline)
         if let Event::FileWrite(ref fw_event) = event {
             self.handle_filewrite_event(fw_event);
-            if let Some(ref sender) = self.raw_event_sender {
+            if self.has_raw_sink() {
                 let ppid = self.pid_table.lookup_ppid(fw_event.pid);
                 let raw = crate::raw_event::RawEvent::from_filewrite(fw_event, ppid);
-                sender.try_send(raw);
+                self.fanout_raw(raw);
             }
             // After mapper is updated, try to resolve any pending GenAI events
             self.resolve_pending_genai();
@@ -460,10 +463,10 @@ impl AgentSight {
                 "ProcFs: pid={} op={} path={} ret={} cgroup_id={} count={} total_bytes={}",
                 e.pid, e.op_name(), e.path, e.ret, e.cgroup_id, e.count, e.total_bytes
             );
-            if let Some(ref sender) = self.raw_event_sender {
+            if self.has_raw_sink() {
                 let ppid = self.pid_table.lookup_ppid(e.pid);
                 let raw = crate::raw_event::RawEvent::from_procfs(e, ppid);
-                sender.try_send(raw);
+                self.fanout_raw(raw);
             }
             return None;
         }
@@ -475,10 +478,10 @@ impl AgentSight {
                 "ProcNet: pid={} op={} src={}:{} dst={}:{} ret={} cgroup_id={} count={}",
                 e.pid, e.op_name(), src_ip, e.port, dst_ip, e.dst_port, e.ret, e.cgroup_id, e.count
             );
-            if let Some(ref sender) = self.raw_event_sender {
+            if self.has_raw_sink() {
                 let ppid = self.pid_table.lookup_ppid(e.pid);
                 let raw = crate::raw_event::RawEvent::from_procnet(e, ppid);
-                sender.try_send(raw);
+                self.fanout_raw(raw);
             }
             return None;
         }
@@ -487,10 +490,10 @@ impl AgentSight {
                 "ProcSig: pid={} comm={} op={} target_pid={} signal={} ret={} cgroup_id={} count={}",
                 e.pid, e.comm, e.op_name(), e.target_pid, e.signal, e.ret, e.cgroup_id, e.count
             );
-            if let Some(ref sender) = self.raw_event_sender {
+            if self.has_raw_sink() {
                 let ppid = self.pid_table.lookup_ppid(e.pid);
                 let raw = crate::raw_event::RawEvent::from_procsig(e, ppid);
-                sender.try_send(raw);
+                self.fanout_raw(raw);
             }
             return None;
         }
@@ -516,16 +519,15 @@ impl AgentSight {
                         header.cgroup_id, header.timestamp_ns,
                     );
                     // Fan-out to raw channel
-                    if let Some(ref sender) = self.raw_event_sender {
+                    if self.has_raw_sink() {
                         let raw = crate::raw_event::RawEvent::from_proctrace_exec(
                             header, filename, args, header.ppid,
                         );
-                        sender.try_send(raw);
+                        self.fanout_raw(raw);
                     }
                 }
                 VariableEvent::Exit { header, exit_code } => {
-                    if let Some(ref sender) = self.raw_event_sender {
-                        // Prefer PidTable ppid (populated from exec); fall back to BPF header.
+                    if self.has_raw_sink() {
                         let ppid = {
                             let table_ppid = self.pid_table.lookup_ppid(header.pid);
                             if table_ppid != 0 { table_ppid } else { header.ppid }
@@ -533,7 +535,7 @@ impl AgentSight {
                         let raw = crate::raw_event::RawEvent::from_proctrace_exit(
                             header, *exit_code, ppid,
                         );
-                        sender.try_send(raw);
+                        self.fanout_raw(raw);
                     }
                 }
                 _ => {} // Stdout / Unknown — no raw event fan-out
@@ -708,6 +710,30 @@ impl AgentSight {
     /// When set, completed events are pushed through this channel.
     pub fn set_ffi_sender(&mut self, sender: FfiEventSender) {
         self.ffi_sender = Some(sender);
+    }
+
+    /// Install an FFI raw event sender for raw event FFI delivery.
+    pub fn set_raw_ffi_sender(&mut self, sender: RawFfiSender) {
+        self.raw_ffi_sender = Some(sender);
+    }
+
+    /// Fan-out a RawEvent to configured sinks (SQLite batch writer + FFI channel).
+    /// Clone only when both sinks are active; single-sink path uses move semantics.
+    fn fanout_raw(&self, raw: crate::raw_event::RawEvent) {
+        match (&self.raw_ffi_sender, &self.raw_event_sender) {
+            (Some(ffi), Some(db)) => {
+                ffi.try_send(raw.clone());
+                db.try_send(raw);
+            }
+            (Some(ffi), None) => ffi.try_send(raw),
+            (None, Some(db)) => db.try_send(raw),
+            (None, None) => {}
+        }
+    }
+
+    /// Returns true if at least one raw event sink is configured.
+    fn has_raw_sink(&self) -> bool {
+        self.raw_event_sender.is_some() || self.raw_ffi_sender.is_some()
     }
 
     /// Export GenAI events to all registered exporters
