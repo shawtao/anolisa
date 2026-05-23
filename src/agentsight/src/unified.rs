@@ -717,6 +717,16 @@ impl AgentSight {
         self.raw_ffi_sender = Some(sender);
     }
 
+    /// Register a cgroup inode ID into the BPF cgroup_filter map at runtime.
+    pub fn add_traced_cgroup(&mut self, cgroup_id: u64) -> anyhow::Result<()> {
+        self.probes.add_traced_cgroup(cgroup_id)
+    }
+
+    /// Remove a cgroup inode ID from the BPF cgroup_filter map at runtime.
+    pub fn remove_traced_cgroup(&mut self, cgroup_id: u64) -> anyhow::Result<()> {
+        self.probes.remove_traced_cgroup(cgroup_id)
+    }
+
     /// Fan-out a RawEvent to configured sinks (SQLite batch writer + FFI channel).
     /// Clone only when both sinks are active; single-sink path uses move semantics.
     fn fanout_raw(&self, raw: crate::raw_event::RawEvent) {

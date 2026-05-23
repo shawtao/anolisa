@@ -26,7 +26,10 @@ enum procfs_op {
     PROCFS_CHDIR     = 5,
     PROCFS_WRITE_ERR = 6,
     PROCFS_WRITE_AGG = 7,
-    PROCFS_OPEN      = 8,
+    PROCFS_OPEN      = 8,   /* open: errors (ret<0) emitted via ringbuf with count=1;
+                             * successes (ret==0) aggregated in open_agg_map and emitted
+                             * by user-space flush with accumulated count.
+                             */
 };
 
 // Single filesystem event - sent via ringbuf
@@ -39,9 +42,29 @@ struct procfs_event {
     u64 cgroup_id;
     u32 op;                           // enum procfs_op
     s32 ret;
+    u32 count;                        // aggregation count; 1 for non-aggregated events
     char comm[TASK_COMM_LEN];
     char path[MAX_FILENAME_LEN];
     char new_path[MAX_FILENAME_LEN];  // used by rename
+};
+
+// openat aggregation key (per-pid, per-path)
+struct open_agg_key {
+    u32 pid;
+    u32 _pad;
+    char path[MAX_FILENAME_LEN];
+};
+
+// openat aggregation value (sliding window state)
+struct open_agg_val {
+    u64 first_ts;
+    u64 last_ts;
+    u64 cgroup_id;
+    u32 tid;
+    u32 uid;
+    u32 count;
+    u32 _pad;
+    char comm[TASK_COMM_LEN];
 };
 
 // Write aggregation key (per-pid)

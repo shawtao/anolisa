@@ -490,14 +490,15 @@ impl Probes {
             })
             .context("failed to spawn poll thread")?;
 
-        // Spawn flush thread for per-CPU aggregation maps (procnet/procsig).
+        // Spawn flush thread for per-CPU aggregation maps (procnet/procsig/procfs).
         // When re-enabling procfs write (#if 1 in procfs.bpf.c), restore:
         //   let write_agg = self.procfs.as_ref().and_then(|p| p.write_agg_map_handle().ok());
         //   if write_agg.is_some() || connect_agg... in the condition below, and
         //   the flush_write_agg branch inside the loop (see block comment there).
         let connect_agg = self.procnet.as_ref().and_then(|p| p.connect_agg_map_handle().ok());
         let fork_agg = self.procsig.as_ref().and_then(|p| p.fork_agg_map_handle().ok());
-        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() {
+        let open_agg = self.procfs.as_ref().and_then(|p| p.open_agg_map_handle().ok());
+        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() || open_agg.is_some() {
             let flush_tx = self.event_tx.clone();
             let flush_stop = Arc::clone(&stop_flag);
             let interval = Duration::from_millis(flush_interval_ms.max(1));
@@ -516,6 +517,9 @@ impl Probes {
                         }
                         if let Some(ref m) = fork_agg {
                             super::procsig::flush_fork_agg(m, &flush_tx);
+                        }
+                        if let Some(ref m) = open_agg {
+                            super::procfs::flush_open_agg(m, &flush_tx);
                         }
                     }
                 })

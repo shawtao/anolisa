@@ -30,6 +30,12 @@ pub(crate) enum FfiEvent {
     Raw(crate::raw_event::RawEvent),
 }
 
+/// Commands sent from the FFI caller thread to the background pipeline thread.
+enum ProbeCommand {
+    AddCgroup(u64),
+    RemoveCgroup(u64),
+}
+
 /// Wraps an `mpsc::Sender<FfiEvent>` together with the `eventfd` descriptor
 /// so that a single `.send()` call both enqueues the event and wakes up the
 /// consumer's epoll/select loop.
@@ -208,6 +214,9 @@ pub struct AgentsightHandle {
     raw_rx: mpsc::Receiver<crate::raw_event::RawEvent>,
     raw_tx: Option<mpsc::Sender<crate::raw_event::RawEvent>>,
     raw_eventfd: i32,
+    /// Channel for runtime probe control commands (e.g. dynamic cgroup filter updates).
+    /// Created in `agentsight_start()`; the receiver end is moved into the background thread.
+    probe_cmd_tx: Option<mpsc::Sender<ProbeCommand>>,
 }
 
 // ===========================================================================
@@ -610,6 +619,7 @@ pub unsafe extern "C" fn agentsight_new(
         raw_rx,
         raw_tx: Some(raw_tx),
         raw_eventfd: raw_efd,
+        probe_cmd_tx: None,
     }))
 }
 
@@ -645,8 +655,12 @@ pub unsafe extern "C" fn agentsight_start(h: *mut AgentsightHandle) -> c_int {
     running.store(true, Ordering::SeqCst);
     let eventfd = handle.eventfd;
 
+    // Probe control channel: caller thread sends commands; background thread drains them.
+    let (probe_cmd_tx, probe_cmd_rx) = mpsc::channel::<ProbeCommand>();
+    handle.probe_cmd_tx = Some(probe_cmd_tx);
+
     handle.thread = Some(std::thread::spawn(move || {
-        ffi_background_thread(config, tx, eventfd, running, raw_tx, raw_efd);
+        ffi_background_thread(config, tx, eventfd, running, raw_tx, raw_efd, probe_cmd_rx);
     }));
 
     0
@@ -663,6 +677,7 @@ fn ffi_background_thread(
     running: Arc<AtomicBool>,
     raw_tx: Option<mpsc::Sender<crate::raw_event::RawEvent>>,
     raw_eventfd: i32,
+    probe_cmd_rx: mpsc::Receiver<ProbeCommand>,
 ) {
     let sender = FfiEventSender { tx, eventfd };
 
@@ -737,6 +752,26 @@ fn ffi_background_thread(
 
     // Event loop controlled by the external running flag.
     while running.load(Ordering::SeqCst) {
+        // Drain probe commands (non-blocking)
+        while let Ok(cmd) = probe_cmd_rx.try_recv() {
+            match cmd {
+                ProbeCommand::AddCgroup(id) => {
+                    if let Err(e) = sight.add_traced_cgroup(id) {
+                        log::warn!("add_traced_cgroup({}) failed: {}", id, e);
+                    } else {
+                        log::info!("Added cgroup_id {} to BPF filter", id);
+                    }
+                }
+                ProbeCommand::RemoveCgroup(id) => {
+                    if let Err(e) = sight.remove_traced_cgroup(id) {
+                        log::warn!("remove_traced_cgroup({}) failed: {}", id, e);
+                    } else {
+                        log::info!("Removed cgroup_id {} from BPF filter", id);
+                    }
+                }
+            }
+        }
+
         if sight.try_process().is_none() {
             // No event available — flush any timed-out pending GenAI events
             sight.flush_expired_pending_genai();
@@ -985,6 +1020,65 @@ pub unsafe extern "C" fn agentsight_read_raw(
     drain_eventfd(handle.raw_eventfd);
 
     count
+}
+
+// ---- Dynamic cgroup filter control ----
+
+/// Add a cgroup inode ID to the BPF cgroup_filter map at runtime.
+/// Returns 0 on success, -1 on failure (check agentsight_last_error()).
+/// Requires agentsight_start() to have been called first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_add_traced_cgroup(
+    h: *mut AgentsightHandle,
+    cgroup_id: u64,
+) -> c_int {
+    if h.is_null() {
+        set_last_error("null handle");
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match &handle.probe_cmd_tx {
+        Some(tx) => {
+            if tx.send(ProbeCommand::AddCgroup(cgroup_id)).is_err() {
+                set_last_error("probe command channel closed");
+                -1
+            } else {
+                0
+            }
+        }
+        None => {
+            set_last_error("handle not started or probe_cmd_tx not initialized");
+            -1
+        }
+    }
+}
+
+/// Remove a cgroup inode ID from the BPF cgroup_filter map at runtime.
+/// Returns 0 on success, -1 on failure (check agentsight_last_error()).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn agentsight_remove_traced_cgroup(
+    h: *mut AgentsightHandle,
+    cgroup_id: u64,
+) -> c_int {
+    if h.is_null() {
+        set_last_error("null handle");
+        return -1;
+    }
+    let handle = unsafe { &*h };
+    match &handle.probe_cmd_tx {
+        Some(tx) => {
+            if tx.send(ProbeCommand::RemoveCgroup(cgroup_id)).is_err() {
+                set_last_error("probe command channel closed");
+                -1
+            } else {
+                0
+            }
+        }
+        None => {
+            set_last_error("handle not started or probe_cmd_tx not initialized");
+            -1
+        }
+    }
 }
 
 #[cfg(test)]

@@ -104,11 +104,46 @@ impl ProcFsEvent {
             comm,
             path,
             new_path,
-            count: 0,
+            count: raw.count as u64,
             total_bytes: 0,
             first_ts: 0,
             last_ts: 0,
         })
+    }
+
+    /// Construct an aggregated open event from open_agg_map key/value.
+    /// One PROCFS_OPEN_AGG event per unique (pid, path) per flush window.
+    pub fn from_open_agg(key: &open_agg_key, val: &open_agg_val) -> Self {
+        let comm = val.comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>();
+        let comm = String::from_utf8_lossy(&comm).into_owned();
+
+        let path = key.path
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>();
+        let path = String::from_utf8_lossy(&path).into_owned();
+
+        ProcFsEvent {
+            pid: key.pid,
+            tid: val.tid,
+            uid: val.uid,
+            timestamp_ns: config::ktime_to_unix_ns(val.last_ts),
+            cgroup_id: val.cgroup_id,
+            op: 8, // PROCFS_OPEN (aggregated success: ret==0, count>=1)
+            ret: 0,
+            comm,
+            path,
+            new_path: String::new(),
+            count: val.count as u64,
+            total_bytes: 0,
+            first_ts: config::ktime_to_unix_ns(val.first_ts),
+            last_ts: config::ktime_to_unix_ns(val.last_ts),
+        }
     }
 
     /*
@@ -265,6 +300,16 @@ impl ProcFsProbe {
                 .context("failed to attach trace_chdir_exit")?,
         );
 
+        // openat enter/exit
+        links.push(
+            self.skel.progs_mut().trace_openat_enter().attach()
+                .context("failed to attach trace_openat_enter")?,
+        );
+        links.push(
+            self.skel.progs_mut().trace_openat_exit().attach()
+                .context("failed to attach trace_openat_exit")?,
+        );
+
         /*
         // write / pwrite64 / writev enter+exit (enable with procfs.bpf.c #if 1)
         links.push(
@@ -297,6 +342,13 @@ impl ProcFsProbe {
         Ok(())
     }
 
+    /// Return a MapHandle for the open_agg_map, used by the flush coroutine
+    pub fn open_agg_map_handle(&self) -> Result<MapHandle> {
+        let binding = self.skel.maps();
+        let map = binding.open_agg_map();
+        MapHandle::try_clone(map).context("failed to create MapHandle from open_agg_map")
+    }
+
     /*
     /// Return a MapHandle for the write_agg_map, used by the flush coroutine
     pub fn write_agg_map_handle(&self) -> Result<MapHandle> {
@@ -307,18 +359,16 @@ impl ProcFsProbe {
     */
 }
 
-/*
-/// Drain the per-CPU `write_agg_map`: aggregate per-CPU values for each key,
-/// emit a [`crate::event::Event::ProcFs`] event, then delete the entry.
+/// Drain the per-CPU `open_agg_map`: aggregate per-CPU values for each key,
+/// emit a [`crate::event::Event::ProcFs`] event with op=PROCFS_OPEN_AGG, then delete the entry.
 ///
 /// Safe to call when the map is empty (becomes a no-op).
-/// Re-enable with procfs.bpf.c write maps (#if 1) and probes.rs flush thread.
-pub fn flush_write_agg(
+pub fn flush_open_agg(
     map: &MapHandle,
     tx: &crossbeam_channel::Sender<crate::event::Event>,
 ) {
-    let key_size = std::mem::size_of::<write_agg_key>();
-    let val_size = std::mem::size_of::<write_agg_val>();
+    let key_size = std::mem::size_of::<open_agg_key>();
+    let val_size = std::mem::size_of::<open_agg_val>();
     let keys: Vec<Vec<u8>> = map.keys().collect();
     for key_bytes in keys {
         if key_bytes.len() != key_size {
@@ -332,9 +382,8 @@ pub fn flush_write_agg(
             }
         };
 
-        let mut agg: write_agg_val = unsafe { std::mem::zeroed() };
-        let mut count: u64 = 0;
-        let mut total_bytes: u64 = 0;
+        let mut agg: open_agg_val = unsafe { std::mem::zeroed() };
+        let mut count: u32 = 0;
         let mut first_ts: u64 = 0;
         let mut last_ts: u64 = 0;
         let mut got_meta = false;
@@ -343,13 +392,12 @@ pub fn flush_write_agg(
                 continue;
             }
             // SAFETY: BPF guarantees layout; size matches val_size.
-            let v: &write_agg_val =
-                unsafe { &*(cpu_val_bytes.as_ptr() as *const write_agg_val) };
+            let v: &open_agg_val =
+                unsafe { &*(cpu_val_bytes.as_ptr() as *const open_agg_val) };
             if v.count == 0 {
                 continue;
             }
             count = count.saturating_add(v.count);
-            total_bytes = total_bytes.saturating_add(v.total_bytes);
             if first_ts == 0 || (v.first_ts != 0 && v.first_ts < first_ts) {
                 first_ts = v.first_ts;
             }
@@ -359,23 +407,23 @@ pub fn flush_write_agg(
             if !got_meta {
                 agg.comm = v.comm;
                 agg.cgroup_id = v.cgroup_id;
+                agg.tid = v.tid;
+                agg.uid = v.uid;
                 got_meta = true;
             }
         }
 
         if count > 0 {
             agg.count = count;
-            agg.total_bytes = total_bytes;
             agg.first_ts = first_ts;
             agg.last_ts = last_ts;
             // SAFETY: key_bytes.len() == key_size is checked above.
-            let key: &write_agg_key =
-                unsafe { &*(key_bytes.as_ptr() as *const write_agg_key) };
-            let event = ProcFsEvent::from_write_agg(key, &agg);
+            let key: &open_agg_key =
+                unsafe { &*(key_bytes.as_ptr() as *const open_agg_key) };
+            let event = ProcFsEvent::from_open_agg(key, &agg);
             let _ = tx.send(crate::event::Event::ProcFs(event));
         }
 
         let _ = map.delete(&key_bytes);
     }
 }
-*/

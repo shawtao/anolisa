@@ -38,6 +38,30 @@ struct {
     __type(value, struct saved_fs_args);
 } scratch_fs_args SEC(".maps");
 
+/* ========== openat aggregation (per-CPU) ==========
+ * Errors bypass aggregation entirely and are emitted via ringbuf with op=PROCFS_OPEN.
+ * Successful opens are aggregated by (pid, path) in a per-CPU hash map; user-space
+ * periodically drains the map (flush_open_agg) and emits one summary event per
+ * unique (pid, path) carrying the accumulated count.
+ */
+#define OPEN_AGG_MAX_ENTRIES 2048
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, OPEN_AGG_MAX_ENTRIES);
+    __type(key, struct open_agg_key);
+    __type(value, struct open_agg_val);
+} open_agg_map SEC(".maps");
+
+/* PERCPU scratch for open_agg_key (264 bytes) — cannot live on BPF stack
+ * together with cgroup_helper locals. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct open_agg_key);
+} scratch_open_agg_key SEC(".maps");
+
 #if 0
 /* --- write aggregation (disabled): flip #if above to 1 to re-enable --- */
 struct saved_write_args {
@@ -61,17 +85,15 @@ struct {
 
 /* ========== helpers ========== */
 
-static __always_inline void emit_fs_event(struct trace_event_raw_sys_exit *ctx,
-                                          u32 op, s32 ret,
-                                          const char *path, u32 path_len,
-                                          const char *new_path, u32 new_path_len)
+/* Low-level emit: caller has already passed cgroup gate and decided count. */
+static __always_inline void emit_fs_event_full(struct trace_event_raw_sys_exit *ctx,
+                                               u32 op, s32 ret,
+                                               u64 cg_id, u32 count,
+                                               const char *path, u32 path_len,
+                                               const char *new_path, u32 new_path_len)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
-
-    u64 cg_id;
-    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
-        return;
 
     struct procfs_event *event = bpf_ringbuf_reserve(&rb, sizeof(*event), 0);
     if (!event)
@@ -85,6 +107,7 @@ static __always_inline void emit_fs_event(struct trace_event_raw_sys_exit *ctx,
     event->cgroup_id = cg_id;
     event->op = op;
     event->ret = ret;
+    event->count = count;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     /* copy paths from saved args (already kernel stack) */
@@ -95,6 +118,21 @@ static __always_inline void emit_fs_event(struct trace_event_raw_sys_exit *ctx,
         event->new_path[0] = '\0';
 
     bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline void emit_fs_event(struct trace_event_raw_sys_exit *ctx,
+                                          u32 op, s32 ret,
+                                          const char *path, u32 path_len,
+                                          const char *new_path, u32 new_path_len)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
+        return;
+
+    emit_fs_event_full(ctx, op, ret, cg_id, 1, path, path_len, new_path, new_path_len);
 }
 
 /* ========== unlinkat (delete) ========== */
@@ -357,14 +395,61 @@ SEC("tp/syscalls/sys_exit_openat")
 int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    s32 ret = (s32)ctx->ret;
 
     struct saved_fs_args *args = bpf_map_lookup_elem(&temp_fs_args, &pid_tgid);
     if (!args)
         return 0;
 
-    emit_fs_event(ctx, args->op, (s32)ctx->ret,
-                  args->path, sizeof(args->path),
-                  NULL, 0);
+    /* cgroup gate (already checked at enter, but PID could be reaped/replaced) */
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(pid, &cg_id)) {
+        bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+        return 0;
+    }
+
+    /* Errors bypass aggregation — emit every error event via ringbuf so callers
+     * never miss an ENOENT/EACCES/etc. on a hot path. */
+    if (ret < 0) {
+        emit_fs_event_full(ctx, PROCFS_OPEN, ret, cg_id, 1,
+                           args->path, sizeof(args->path),
+                           NULL, 0);
+        bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+        return 0;
+    }
+
+    /* Success path: aggregate per (pid, path) in per-CPU hash map.
+     * No ringbuf submission — user-space flush_open_agg() drains the map
+     * periodically and emits one PROCFS_OPEN_AGG event per unique key. */
+    u32 zero = 0;
+    struct open_agg_key *agg_key = bpf_map_lookup_elem(&scratch_open_agg_key, &zero);
+    if (!agg_key) {
+        bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+        return 0;
+    }
+    __builtin_memset(agg_key, 0, sizeof(*agg_key));
+    agg_key->pid = pid;
+    __builtin_memcpy(agg_key->path, args->path, MAX_FILENAME_LEN);
+
+    u64 now = bpf_ktime_get_ns();
+    struct open_agg_val *val = bpf_map_lookup_elem(&open_agg_map, agg_key);
+    if (val) {
+        /* per-CPU slot already populated on this CPU — just bump the counter */
+        val->count += 1;
+        val->last_ts = now;
+        val->cgroup_id = cg_id;
+    } else {
+        struct open_agg_val new_val = {};
+        new_val.first_ts = now;
+        new_val.last_ts = now;
+        new_val.cgroup_id = cg_id;
+        new_val.tid = (u32)pid_tgid;
+        new_val.uid = bpf_get_current_uid_gid();
+        new_val.count = 1;
+        bpf_get_current_comm(&new_val.comm, sizeof(new_val.comm));
+        bpf_map_update_elem(&open_agg_map, agg_key, &new_val, BPF_NOEXIST);
+    }
 
     bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
     return 0;
