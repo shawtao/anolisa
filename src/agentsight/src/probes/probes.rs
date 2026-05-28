@@ -23,7 +23,7 @@ use super::procmon::{ProcMon, ProcMonEvent};
 use super::filewatch::{FileWatch, RawFileWatchEvent};
 use super::filewrite::{FileWrite as FileWriteProbe, RawFileWriteEvent};
 use super::udpdns::{UdpDns, RawUdpDnsEvent};
-use super::procfs::{ProcFsProbe, ProcFsEvent, RawProcFsEvent};
+use super::procfs::{OpenErrAggregator, ProcFsProbe, ProcFsEvent, RawProcFsEvent};
 use super::procnet::{ProcNetProbe, ProcNetEvent, RawProcNetEvent};
 use super::procsig::{ProcSigProbe, ProcSigEvent, RawProcSigEvent};
 
@@ -66,6 +66,9 @@ pub struct Probes {
     procnet: Option<ProcNetProbe>,
     /// Signal/process control probe (optional)
     procsig: Option<ProcSigProbe>,
+    /// User-space aggregator for OPEN failures (optional, see procfs.rs).
+    /// Shared between the ringbuf callback and the flush thread.
+    open_err_agg: Option<Arc<OpenErrAggregator>>,
     /// Shared ring buffer handle (cloned from proctrace) for polling
     rb_handle: MapHandle,
     /// Unified event channel - events are converted to Event type inside the poller
@@ -97,6 +100,7 @@ impl Probes {
             &probe_config,
             enable_udpdns,
             false,
+            false,
         )
     }
 
@@ -116,6 +120,7 @@ impl Probes {
         probe_config: &ProbeConfig,
         enable_udpdns: bool,
         cgroup_filter_enabled: bool,
+        proc_ext_errors_only: bool,
     ) -> Result<Self> {
         // Create proctrace first - it owns the traced_processes map, the ring
         // buffer, and (when enabled) the cgroup_filter map.
@@ -221,6 +226,7 @@ impl Probes {
                     &rb_handle,
                     cgroup_filter_ref,
                     cgroup_filter_enabled,
+                    proc_ext_errors_only,
                 )
                 .context("failed to create procfs probe")?,
             )
@@ -238,6 +244,7 @@ impl Probes {
                     &rb_handle,
                     cgroup_filter_ref,
                     cgroup_filter_enabled,
+                    proc_ext_errors_only,
                 )
                 .context("failed to create procnet probe")?,
             )
@@ -255,6 +262,7 @@ impl Probes {
                     &rb_handle,
                     cgroup_filter_ref,
                     cgroup_filter_enabled,
+                    proc_ext_errors_only,
                 )
                 .context("failed to create procsig probe")?,
             )
@@ -264,6 +272,16 @@ impl Probes {
         };
 
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        // Install OPEN-error aggregator whenever procfs is on. Python importlib
+        // is the canonical noisy producer (probing many non-existent
+        // entry_points.txt/PKG-INFO during imports), so we collapse those by
+        // default rather than gating behind a config flag.
+        let open_err_agg = if procfs.is_some() {
+            Some(Arc::new(OpenErrAggregator::new()))
+        } else {
+            None
+        };
         
         Ok(Self {
             proctrace,
@@ -275,6 +293,7 @@ impl Probes {
             procfs,
             procnet,
             procsig,
+            open_err_agg,
             rb_handle,
             event_tx,
             event_rx,
@@ -365,6 +384,10 @@ impl Probes {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_inner = Arc::clone(&stop_flag);
 
+        // Clone the aggregator handle for the ringbuf callback closure; the
+        // flush thread uses a second clone below.
+        let open_err_agg_cb = self.open_err_agg.as_ref().map(Arc::clone);
+
         // Build ring buffer from the shared rb handle
         let mut rb_builder = RingBufferBuilder::new();
         rb_builder
@@ -434,10 +457,22 @@ impl Probes {
                     EVENT_SOURCE_PROCFS => {
                         if !has_procfs { return 0; }
                         if data.len() >= procfs_event_size {
-                            ProcFsEvent::from_bytes(data).map(Event::ProcFs)
-                        } else {
-                            None
+                            if let Some(e) = ProcFsEvent::from_bytes(data) {
+                                // Intercept OPEN failures into the user-space
+                                // aggregator when enabled; otherwise forward
+                                // verbatim. try_record returns true only for
+                                // op==PROCFS_OPEN && ret<0, which means the
+                                // event has been merged and must NOT be sent.
+                                if let Some(ref agg) = open_err_agg_cb {
+                                    if agg.try_record(&e) {
+                                        return 0;
+                                    }
+                                }
+                                let _ = event_tx.send(Event::ProcFs(e));
+                            }
+                            return 0;
                         }
+                        None
                     }
                     EVENT_SOURCE_PROCNET => {
                         if !has_procnet { return 0; }
@@ -498,7 +533,8 @@ impl Probes {
         let connect_agg = self.procnet.as_ref().and_then(|p| p.connect_agg_map_handle().ok());
         let fork_agg = self.procsig.as_ref().and_then(|p| p.fork_agg_map_handle().ok());
         let open_agg = self.procfs.as_ref().and_then(|p| p.open_agg_map_handle().ok());
-        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() || open_agg.is_some() {
+        let open_err_agg_flush = self.open_err_agg.as_ref().map(Arc::clone);
+        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() || open_agg.is_some() || open_err_agg_flush.is_some() {
             let flush_tx = self.event_tx.clone();
             let flush_stop = Arc::clone(&stop_flag);
             let interval = Duration::from_millis(flush_interval_ms.max(1));
@@ -520,6 +556,9 @@ impl Probes {
                         }
                         if let Some(ref m) = open_agg {
                             super::procfs::flush_open_agg(m, &flush_tx);
+                        }
+                        if let Some(ref agg) = open_err_agg_flush {
+                            agg.flush(&flush_tx);
                         }
                     }
                 })

@@ -21,7 +21,7 @@ enum procsig_op {
     PROCSIG_SETPGID    = 1,
     PROCSIG_SETSID     = 2,
     PROCSIG_KILL       = 3,
-    PROCSIG_FORK_SINGLE = 4,
+    PROCSIG_FORK_FAIL  = 4,  // fork-family syscall failure (clone/clone3/vfork ret<0)
     PROCSIG_FORK_AGG   = 5,
 };
 

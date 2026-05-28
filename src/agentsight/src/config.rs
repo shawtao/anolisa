@@ -182,6 +182,8 @@ struct JsonFullConfig {
     cgroup_ids: Option<Vec<u64>>,
     #[serde(default)]
     proc_ext_flush_interval_ms: Option<u64>,
+    #[serde(default)]
+    proc_ext_errors_only: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -366,6 +368,15 @@ pub struct AgentsightConfig {
     /// aggregation maps and emits the consolidated events. Default: 500.
     pub proc_ext_flush_interval_ms: u64,
 
+    /// When true, procfs/procnet/procsig probes only emit syscall events with
+    /// `ret < 0`. Aggregation paths (procnet connect success, procfs openat
+    /// success, procsig fork) are fully suppressed. In addition, procsig
+    /// hooks `sys_exit_clone` / `sys_exit_clone3` / `sys_exit_vfork` and emits
+    /// a `PROCSIG_FORK_FAIL` single event whenever fork-family syscalls fail
+    /// (e.g. EAGAIN/ENOMEM/EPERM from pid_max, RLIMIT_NPROC, pids cgroup).
+    /// Default: false.
+    pub proc_ext_errors_only: bool,
+
     // --- Raw Event Storage Configuration ---
     /// Whether to enable raw event storage channel (writes to raw_events.db)
     pub raw_events_enabled: bool,
@@ -448,6 +459,9 @@ impl Default for AgentsightConfig {
 
             // Proc extension probes flush interval (ms) for percpu hash maps
             proc_ext_flush_interval_ms: 500,
+
+            // proc_ext_errors_only mode for procfs/procnet/procsig (default: full event capture)
+            proc_ext_errors_only: false,
 
             // Raw event storage defaults
             raw_events_enabled: false,
@@ -643,6 +657,10 @@ impl AgentsightConfig {
 
         if let Some(v) = parsed.proc_ext_flush_interval_ms {
             self.proc_ext_flush_interval_ms = v;
+        }
+
+        if let Some(v) = parsed.proc_ext_errors_only {
+            self.proc_ext_errors_only = v;
         }
 
         // Raw event storage configuration

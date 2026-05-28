@@ -50,7 +50,7 @@ impl ProcSigEvent {
             1 => "setpgid",
             2 => "setsid",
             3 => "kill",
-            4 => "fork_error",  // reserved: fork failure (not yet implemented)
+            4 => "fork_fail",  // fork-family syscall failure (clone/clone3/vfork ret<0)
             5 => "fork",
             _ => "unknown",
         }
@@ -127,7 +127,7 @@ pub struct ProcSigProbe {
 impl ProcSigProbe {
     /// Create a new ProcSigProbe that reuses existing traced_processes and ring buffer maps
     pub fn new_with_maps(traced_processes: &MapHandle, rb: &MapHandle) -> Result<Self> {
-        Self::new_with_full_maps(traced_processes, rb, None, false)
+        Self::new_with_full_maps(traced_processes, rb, None, false, false)
     }
 
     /// Create a new ProcSigProbe with optional cgroup_filter map sharing.
@@ -136,7 +136,11 @@ impl ProcSigProbe {
         rb: &MapHandle,
         cgroup_filter: Option<&MapHandle>,
         cgroup_filter_enabled: bool,
+        errors_only: bool,
     ) -> Result<Self> {
+        // `errors_only` only drives rodata-based suppression of success events for
+        // setpgid/setsid/kill/fork. Fork-failure capture (clone/clone3/vfork
+        // sys_exit) is always attached in attach() below.
         let mut builder = ProcsigSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
 
@@ -145,6 +149,9 @@ impl ProcSigProbe {
 
         // Mirror the cgroup-filter rodata flag.
         open_skel.rodata_mut().filter_cgroup_enabled = cgroup_filter_enabled;
+
+        // errors_only: only ret < 0 syscalls emitted; fork tracepoint suppressed.
+        open_skel.rodata_mut().errors_only_mode = errors_only;
 
         // Detect cgroup v2 and pass to BPF via rodata.
         open_skel.rodata_mut().cgroup_v2_mode =
@@ -225,6 +232,33 @@ impl ProcSigProbe {
             self.skel.progs_mut().trace_fork().attach()
                 .context("failed to attach trace_fork")?,
         );
+
+        // fork-failure paths: always attached regardless of errors_only mode.
+        // handle_fork_fail() only emits when ret<0, so success forks are filtered
+        // at the source; the cost is one branch per clone/clone3/vfork syscall.
+        links.push(
+            self.skel.progs_mut().trace_clone_exit().attach()
+                .context("failed to attach trace_clone_exit")?,
+        );
+        links.push(
+            self.skel.progs_mut().trace_clone3_exit().attach()
+                .context("failed to attach trace_clone3_exit")?,
+        );
+        links.push(
+            self.skel.progs_mut().trace_vfork_exit().attach()
+                .context("failed to attach trace_vfork_exit")?,
+        );
+
+        // Legacy fork(2): musl-static (busybox) on x86_64 dispatches fork()
+        // directly to __NR_fork rather than clone. arm64 / riscv64 do not
+        // define __NR_fork, so attach must be soft-fail.
+        match self.skel.progs_mut().trace_fork_exit().attach() {
+            Ok(l) => links.push(l),
+            Err(e) => log::warn!(
+                "procsig: skipping legacy tracepoint sys_exit_fork (likely unsupported on this arch): {e}"
+            ),
+        }
+        log::info!("procsig: fork-failure capture enabled (clone/clone3/vfork/fork sys_exit; always-on)");
 
         self._links = links;
         Ok(())

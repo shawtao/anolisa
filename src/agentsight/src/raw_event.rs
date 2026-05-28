@@ -103,7 +103,7 @@ impl RawEvent {
             "port": e.port,
             "dst_addr": dst_addr_str,
             "dst_port": e.dst_port,
-            "family": e.family,
+            "family": e.family_name(),
         });
 
         Self {

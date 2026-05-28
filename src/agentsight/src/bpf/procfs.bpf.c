@@ -13,6 +13,10 @@
 #include "common.h"
 #include "cgroup_helper.h"
 
+/* errors_only mode: when true, only syscalls with ret < 0 are emitted;
+ * the openat success-aggregation path is fully suppressed. */
+const volatile bool errors_only_mode = false;
+
 /* ========== temp storage for enter/exit pairing ========== */
 
 struct saved_fs_args {
@@ -92,6 +96,10 @@ static __always_inline void emit_fs_event_full(struct trace_event_raw_sys_exit *
                                                const char *path, u32 path_len,
                                                const char *new_path, u32 new_path_len)
 {
+    /* errors_only gate: drop successful syscalls. */
+    if (errors_only_mode && ret >= 0)
+        return;
+
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
 
@@ -362,10 +370,13 @@ int trace_chdir_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
-/* ========== openat (open) ========== */
+/* ========== openat / open / creat (shared open) ==========
+ * openat:  args[1] = pathname
+ * open:    args[0] = pathname (legacy, busybox/musl static still emits this)
+ * creat:   args[0] = pathname (legacy; equivalent to open(O_CREAT|O_WRONLY|O_TRUNC))
+ */
 
-SEC("tp/syscalls/sys_enter_openat")
-int trace_openat_enter(struct trace_event_raw_sys_enter *ctx)
+static __always_inline int handle_open_enter(const char *pathname)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
@@ -381,8 +392,6 @@ int trace_openat_enter(struct trace_event_raw_sys_enter *ctx)
     __builtin_memset(args, 0, sizeof(*args));
     args->op = PROCFS_OPEN;
 
-    /* openat: args[0]=dirfd, args[1]=pathname, args[2]=flags, args[3]=mode */
-    const char *pathname = (const char *)ctx->args[1];
     long len = bpf_probe_read_user_str(args->path, sizeof(args->path), pathname);
     if (len < 0)
         return 0;
@@ -391,8 +400,7 @@ int trace_openat_enter(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-SEC("tp/syscalls/sys_exit_openat")
-int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
+static __always_inline int handle_open_exit(struct trace_event_raw_sys_exit *ctx)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
@@ -422,6 +430,11 @@ int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
     /* Success path: aggregate per (pid, path) in per-CPU hash map.
      * No ringbuf submission — user-space flush_open_agg() drains the map
      * periodically and emits one PROCFS_OPEN_AGG event per unique key. */
+    if (errors_only_mode) {
+        bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+        return 0;
+    }
+
     u32 zero = 0;
     struct open_agg_key *agg_key = bpf_map_lookup_elem(&scratch_open_agg_key, &zero);
     if (!agg_key) {
@@ -450,6 +463,180 @@ int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
         bpf_get_current_comm(&new_val.comm, sizeof(new_val.comm));
         bpf_map_update_elem(&open_agg_map, agg_key, &new_val, BPF_NOEXIST);
     }
+
+    bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_openat")
+int trace_openat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* openat: args[0]=dirfd, args[1]=pathname, args[2]=flags, args[3]=mode */
+    return handle_open_enter((const char *)ctx->args[1]);
+}
+
+SEC("tp/syscalls/sys_exit_openat")
+int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_open_exit(ctx);
+}
+
+SEC("tp/syscalls/sys_enter_open")
+int trace_open_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* legacy open: args[0]=pathname, args[1]=flags, args[2]=mode */
+    return handle_open_enter((const char *)ctx->args[0]);
+}
+
+SEC("tp/syscalls/sys_exit_open")
+int trace_open_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_open_exit(ctx);
+}
+
+SEC("tp/syscalls/sys_enter_creat")
+int trace_creat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* creat(path, mode) ≡ open(path, O_CREAT|O_WRONLY|O_TRUNC, mode); args[0]=pathname */
+    return handle_open_enter((const char *)ctx->args[0]);
+}
+
+SEC("tp/syscalls/sys_exit_creat")
+int trace_creat_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_open_exit(ctx);
+}
+
+/* ========== legacy unlink / rmdir / rename / mkdir ==========
+ * busybox-static and musl-static binaries frequently invoke these old syscalls
+ * directly (rather than the *at variants), so the *at-only tracepoints above
+ * miss them. Each enter/exit pair is intentionally a thin wrapper that mirrors
+ * the corresponding *at handler — only the args index differs.
+ */
+
+static __always_inline int handle_single_path_enter(const char *pathname, u32 op)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
+        return 0;
+
+    u32 zero = 0;
+    struct saved_fs_args *args = bpf_map_lookup_elem(&scratch_fs_args, &zero);
+    if (!args)
+        return 0;
+    __builtin_memset(args, 0, sizeof(*args));
+    args->op = op;
+
+    long len = bpf_probe_read_user_str(args->path, sizeof(args->path), pathname);
+    if (len < 0)
+        return 0;
+
+    bpf_map_update_elem(&temp_fs_args, &pid_tgid, args, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int handle_fs_exit_single(struct trace_event_raw_sys_exit *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    struct saved_fs_args *args = bpf_map_lookup_elem(&temp_fs_args, &pid_tgid);
+    if (!args)
+        return 0;
+
+    emit_fs_event(ctx, args->op, (s32)ctx->ret,
+                  args->path, sizeof(args->path),
+                  NULL, 0);
+
+    bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_unlink")
+int trace_unlink_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* unlink(pathname); semantically equivalent to unlinkat(AT_FDCWD, p, 0) → reuse PROCFS_DELETE */
+    return handle_single_path_enter((const char *)ctx->args[0], PROCFS_DELETE);
+}
+
+SEC("tp/syscalls/sys_exit_unlink")
+int trace_unlink_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fs_exit_single(ctx);
+}
+
+SEC("tp/syscalls/sys_enter_rmdir")
+int trace_rmdir_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* rmdir(pathname); kept distinct from unlink for clearer downstream semantics */
+    return handle_single_path_enter((const char *)ctx->args[0], PROCFS_RMDIR);
+}
+
+SEC("tp/syscalls/sys_exit_rmdir")
+int trace_rmdir_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fs_exit_single(ctx);
+}
+
+SEC("tp/syscalls/sys_enter_mkdir")
+int trace_mkdir_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* mkdir(pathname, mode); args[0]=pathname (legacy, no dirfd) */
+    return handle_single_path_enter((const char *)ctx->args[0], PROCFS_MKDIR);
+}
+
+SEC("tp/syscalls/sys_exit_mkdir")
+int trace_mkdir_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fs_exit_single(ctx);
+}
+
+SEC("tp/syscalls/sys_enter_rename")
+int trace_rename_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* rename(oldname, newname); args[0]=oldname, args[1]=newname */
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
+        return 0;
+
+    u32 zero = 0;
+    struct saved_fs_args *args = bpf_map_lookup_elem(&scratch_fs_args, &zero);
+    if (!args)
+        return 0;
+    __builtin_memset(args, 0, sizeof(*args));
+    args->op = PROCFS_RENAME;
+
+    const char *oldname = (const char *)ctx->args[0];
+    long len = bpf_probe_read_user_str(args->path, sizeof(args->path), oldname);
+    if (len < 0)
+        return 0;
+
+    const char *newname = (const char *)ctx->args[1];
+    len = bpf_probe_read_user_str(args->new_path, sizeof(args->new_path), newname);
+    if (len < 0)
+        return 0;
+
+    bpf_map_update_elem(&temp_fs_args, &pid_tgid, args, BPF_ANY);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_exit_rename")
+int trace_rename_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    struct saved_fs_args *args = bpf_map_lookup_elem(&temp_fs_args, &pid_tgid);
+    if (!args)
+        return 0;
+
+    emit_fs_event(ctx, args->op, (s32)ctx->ret,
+                  args->path, sizeof(args->path),
+                  args->new_path, sizeof(args->new_path));
 
     bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
     return 0;

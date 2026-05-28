@@ -29,6 +29,10 @@ enum procfs_op {
     PROCFS_OPEN      = 8,   /* open: errors (ret<0) emitted via ringbuf with count=1;
                              * successes (ret==0) aggregated in open_agg_map and emitted
                              * by user-space flush with accumulated count.
+                             * Shared by openat / open / creat tracepoints.
+                             */
+    PROCFS_RMDIR     = 9,   /* legacy rmdir(2): kept distinct from PROCFS_DELETE so that
+                             * "remove directory" vs "unlink file" are not conflated.
                              */
 };
 

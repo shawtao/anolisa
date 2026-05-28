@@ -18,10 +18,11 @@ typedef signed long long    s64;
 typedef unsigned long long  u64;
 
 enum procnet_op {
-    PROCNET_BIND        = 1,
-    PROCNET_LISTEN      = 2,
-    PROCNET_CONNECT_ERR = 3,
-    PROCNET_CONNECT_AGG = 4,
+    PROCNET_BIND             = 1,
+    PROCNET_LISTEN           = 2,
+    PROCNET_CONNECT_ERR      = 3,
+    PROCNET_CONNECT_AGG      = 4,
+    PROCNET_GETSOCKOPT_ERR   = 5,
 };
 
 // Single network event - sent via ringbuf

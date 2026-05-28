@@ -55,7 +55,21 @@ impl ProcNetEvent {
             2 => "listen",
             3 => "connect_error",
             4 => "connect",
+            5 => "getsockopt_error",
             _ => "unknown",
+        }
+    }
+
+    /// Human-readable address family name
+    pub fn family_name(&self) -> &'static str {
+        match self.family {
+            0 => "AF_UNSPEC",
+            1 => "AF_UNIX",
+            2 => "AF_INET(IPv4)",
+            10 => "AF_INET6(IPv6)",
+            16 => "AF_NETLINK",
+            17 => "AF_PACKET",
+            _ => "AF_UNKNOWN",
         }
     }
 
@@ -138,7 +152,7 @@ pub struct ProcNetProbe {
 impl ProcNetProbe {
     /// Create a new ProcNetProbe that reuses existing traced_processes and ring buffer maps
     pub fn new_with_maps(traced_processes: &MapHandle, rb: &MapHandle) -> Result<Self> {
-        Self::new_with_full_maps(traced_processes, rb, None, false)
+        Self::new_with_full_maps(traced_processes, rb, None, false, false)
     }
 
     /// Create a new ProcNetProbe with optional cgroup_filter map sharing.
@@ -147,6 +161,7 @@ impl ProcNetProbe {
         rb: &MapHandle,
         cgroup_filter: Option<&MapHandle>,
         cgroup_filter_enabled: bool,
+        errors_only: bool,
     ) -> Result<Self> {
         let mut builder = ProcnetSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
@@ -156,6 +171,9 @@ impl ProcNetProbe {
 
         // Mirror the cgroup-filter rodata flag.
         open_skel.rodata_mut().filter_cgroup_enabled = cgroup_filter_enabled;
+
+        // errors_only: only ret < 0 syscalls emitted; connect aggregation suppressed.
+        open_skel.rodata_mut().errors_only_mode = errors_only;
 
         // Detect cgroup v2 and pass to BPF via rodata.
         open_skel.rodata_mut().cgroup_v2_mode =
@@ -229,6 +247,16 @@ impl ProcNetProbe {
         links.push(
             self.skel.progs_mut().trace_connect_exit().attach()
                 .context("failed to attach trace_connect_exit")?,
+        );
+
+        // getsockopt enter/exit (captures SO_ERROR for delayed connect errors)
+        links.push(
+            self.skel.progs_mut().trace_getsockopt_enter().attach()
+                .context("failed to attach trace_getsockopt_enter")?,
+        );
+        links.push(
+            self.skel.progs_mut().trace_getsockopt_exit().attach()
+                .context("failed to attach trace_getsockopt_exit")?,
         );
 
         self._links = links;

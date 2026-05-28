@@ -173,8 +173,17 @@ impl AgentSight {
                 &config.probe_config,
                 enable_udpdns,
                 config.cgroup_filter_enabled,
+                config.proc_ext_errors_only,
             )
             .context("Failed to create probes")?;
+
+        if config.proc_ext_errors_only {
+            log::info!(
+                "proc_ext probes: proc_ext_errors_only mode enabled (procnet/procfs/procsig success events suppressed)"
+            );
+        }
+
+        // Fork-failure capture is always-on (clone/clone3/vfork sys_exit), see procsig::attach().
 
         // Attach procmon for process monitoring
         probes.attach().context("Failed to attach probes")?;

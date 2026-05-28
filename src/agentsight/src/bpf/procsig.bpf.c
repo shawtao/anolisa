@@ -11,6 +11,10 @@
 #include "common.h"
 #include "cgroup_helper.h"
 
+/* errors_only mode: when true, only syscalls with ret < 0 are emitted;
+ * the sched_process_fork aggregation path (no ret) is fully suppressed. */
+const volatile bool errors_only_mode = false;
+
 /* ========== temp storage for enter/exit pairing ========== */
 
 struct saved_sig_args {
@@ -38,6 +42,10 @@ struct {
 static __always_inline void emit_sig_event(u32 op, s32 ret,
                                            u32 target_pid, u32 signal)
 {
+    /* errors_only gate: drop successful syscalls. */
+    if (errors_only_mode && ret >= 0)
+        return;
+
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
 
@@ -176,6 +184,11 @@ int trace_kill_exit(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/sched/sched_process_fork")
 int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
+    /* fork carries no syscall return value — fully suppress under errors_only.
+     * Failed fork paths are captured unconditionally via sys_exit_clone/clone3/vfork below. */
+    if (errors_only_mode)
+        return 0;
+
     u32 parent_pid = ctx->parent_pid;
 
     u64 cg_id;
@@ -201,6 +214,58 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx)
     }
 
     return 0;
+}
+
+/* ========== fork failure — clone/clone3/vfork sys_exit (errors_only only) ==========
+ *
+ * sched_process_fork only fires AFTER a child task has been created, so it
+ * cannot observe failed fork-family syscalls (EAGAIN from pid_max /
+ * RLIMIT_NPROC, ENOMEM, EPERM from pids cgroup, etc.). For those diagnostic
+ * cases we hook the syscall-exit tracepoints directly and emit a single
+ * PROCSIG_FORK_FAIL event when ret < 0. The event reuses the procsig_event
+ * layout — `ret` carries the negative errno, `target_pid` and `signal` are 0.
+ *
+ * These programs are only attached when proc_ext_errors_only is enabled by
+ * the user-space loader, so the default (full-event-capture) mode pays zero
+ * runtime cost.
+ */
+
+static __always_inline int handle_fork_fail(s32 ret)
+{
+    if (ret >= 0)
+        return 0;
+    /* emit_sig_event already gates on errors_only_mode + cgroup filter. */
+    emit_sig_event(PROCSIG_FORK_FAIL, ret, 0, 0);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_exit_clone")
+int trace_clone_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fork_fail((s32)ctx->ret);
+}
+
+SEC("tp/syscalls/sys_exit_clone3")
+int trace_clone3_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fork_fail((s32)ctx->ret);
+}
+
+SEC("tp/syscalls/sys_exit_vfork")
+int trace_vfork_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fork_fail((s32)ctx->ret);
+}
+
+/* Legacy fork(2): musl libc on architectures that define __NR_fork (e.g. x86_64)
+ * dispatches fork() directly to this syscall rather than clone(SIGCHLD, 0).
+ * Without this hook, busybox-musl static binaries inside a cgroup that hits
+ * pids.max / RLIMIT_NPROC will silently miss every fork-failure event.
+ * arm64 has no __NR_fork; attach is performed with try_attach in user space. */
+SEC("tp/syscalls/sys_exit_fork")
+int trace_fork_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_fork_fail((s32)ctx->ret);
 }
 
 char LICENSE[] SEC("license") = "GPL";
