@@ -12,8 +12,11 @@
 #include <bpf/bpf_endian.h>
 #include "udpdns.h"
 
-// Include common.h with traced_processes map - skip already-traced processes
+// Include common.h with traced_processes map + cgroup_filter map / rodata.
+// cgroup_helper.h MUST be included AFTER common.h so traced_pid_cgroup_gate_*
+// macros see the shared definitions.
 #include "common.h"
+#include "cgroup_helper.h"
 
 // DNS header constants
 #define DNS_HEADER_LEN 12
@@ -40,8 +43,42 @@ int BPF_PROG(trace_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
     __u32 pid = pid_tgid >> 32;
     __u32 tid = (__u32)pid_tgid;
 
-    // Skip processes already being traced - no need to discover them again
-    if (bpf_map_lookup_elem(&traced_processes, &pid))
+    /* ── Dual-channel admission ──────────────────────────────────────────
+     * Channel A (correlation, NEW): when cgroup filtering is enabled and
+     *   the current task's cgroup_id is registered in cgroup_filter, emit
+     *   the event WITH cgroup_id so user-space can build a PID/cgroup →
+     *   domain LRU for procnet connect error reverse-lookup.
+     *
+     * Channel B (discovery, LEGACY): when the PID is NOT yet in
+     *   traced_processes, emit the event (cgroup_id=0) so AgentScanner
+     *   can match domain rules and trigger attach_process().
+     *
+     * The two channels are independent OR conditions; either one is
+     * sufficient to emit. When neither matches, the packet is dropped
+     * (e.g. an already-tracked PID outside the configured cgroup set).
+     *
+     * Backwards compatibility: when filter_cgroup_enabled == false
+     *   (default for non-containersight users), channel A is inert and
+     *   behaviour is identical to the original "skip already-traced"
+     *   discovery path.
+     */
+    bool emit = false;
+    u64 cg_id = 0;
+#ifndef NO_CGROUP_FILTER
+    if (filter_cgroup_enabled) {
+        cg_id = get_cgroup_id_compat();
+        if (bpf_map_lookup_elem(&cgroup_filter, &cg_id))
+            emit = true;
+    }
+#endif
+    if (!emit) {
+        // Legacy discovery: only fire for PIDs not yet tracked.
+        if (!bpf_map_lookup_elem(&traced_processes, &pid))
+            emit = true;
+        else
+            cg_id = 0; // already-tracked + not in cgroup filter → drop
+    }
+    if (!emit)
         return 0;
 
     // Read the first iovec from msg_iter to get user-space buffer pointer
@@ -92,6 +129,7 @@ int BPF_PROG(trace_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
     event->tid = tid;
     event->uid = bpf_get_current_uid_gid();
     event->payload_len = read_len;
+    event->cgroup_id = cg_id;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     bpf_ringbuf_submit(event, 0);

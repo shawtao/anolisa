@@ -42,6 +42,12 @@ pub struct UdpDnsEvent {
     pub tid: u32,
     pub uid: u32,
     pub timestamp_ns: u64,
+    /// cgroup id of producing task. Non-zero when the event was admitted via
+    /// the cgroup-filter "correlation" channel (used by containersight to
+    /// build a PID/cgroup → domain LRU). Zero when admitted via the legacy
+    /// "discovery" channel (PID not in `traced_processes`), which preserves
+    /// the original behaviour for non-containersight users.
+    pub cgroup_id: u64,
     pub comm: String,
     pub domain: String,
 }
@@ -145,6 +151,7 @@ impl UdpDnsEvent {
             tid: raw.tid,
             uid: raw.uid,
             timestamp_ns: config::ktime_to_unix_ns(raw.timestamp_ns),
+            cgroup_id: raw.cgroup_id,
             comm,
             domain,
         })
@@ -159,17 +166,46 @@ pub struct UdpDns {
 }
 
 impl UdpDns {
-    /// Create a new UdpDns that reuses existing traced_processes and ring buffer maps
+    /// Create a new UdpDns that reuses traced_processes + ring buffer only.
     ///
-    /// # Arguments
-    /// * `traced_processes` - External MapHandle for process filtering (skip already-traced)
-    /// * `rb` - External ring buffer map handle to reuse
+    /// Backwards-compat shim: cgroup_filter sharing is disabled, so only the
+    /// legacy "discovery" channel B is active (events fire for PIDs not yet
+    /// present in `traced_processes`). All current AgentSight CLI users hit
+    /// this path.
     pub fn new_with_maps(traced_processes: &MapHandle, rb: &MapHandle) -> Result<Self> {
+        Self::new_with_full_maps(traced_processes, rb, None, false)
+    }
+
+    /// Create a new UdpDns with optional cgroup_filter map sharing.
+    ///
+    /// When `cgroup_filter_enabled == true` AND `cgroup_filter` is provided,
+    /// the BPF program admits events via BOTH channels:
+    ///   - Channel A (correlation): cgroup_id is in `cgroup_filter` map
+    ///   - Channel B (discovery): PID is NOT in `traced_processes` map
+    /// Either channel matching is sufficient to emit; cgroup_id in the
+    /// emitted event distinguishes the source (non-zero = channel A).
+    ///
+    /// When disabled, only channel B fires (identical to the original
+    /// `new_with_maps` behaviour).
+    pub fn new_with_full_maps(
+        traced_processes: &MapHandle,
+        rb: &MapHandle,
+        cgroup_filter: Option<&MapHandle>,
+        cgroup_filter_enabled: bool,
+    ) -> Result<Self> {
         let mut builder = UdpdnsSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
 
         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
         let mut open_skel = builder.open().context("failed to open udpdns BPF object")?;
+
+        // Mirror the cgroup-filter rodata flag (drives channel A admission).
+        open_skel.rodata_mut().filter_cgroup_enabled = cgroup_filter_enabled;
+
+        // Detect cgroup v2 unified hierarchy at userspace and pass via rodata
+        // so get_cgroup_id_compat() picks the right path inside BPF.
+        open_skel.rodata_mut().cgroup_v2_mode =
+            std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
 
         // Reuse external traced_processes map
         open_skel
@@ -184,6 +220,15 @@ impl UdpDns {
             .rb()
             .reuse_fd(rb.as_fd())
             .context("failed to reuse external rb map for udpdns")?;
+
+        // Reuse external cgroup_filter map (if provided)
+        if let Some(map) = cgroup_filter {
+            open_skel
+                .maps_mut()
+                .cgroup_filter()
+                .reuse_fd(map.as_fd())
+                .context("failed to reuse external cgroup_filter map for udpdns")?;
+        }
 
         let skel = open_skel.load().context("failed to load udpdns BPF object")?;
 

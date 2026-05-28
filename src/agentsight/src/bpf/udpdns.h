@@ -24,6 +24,8 @@ struct udpdns_event {
     u32 tid;
     u32 uid;
     u32 payload_len;        // actual DNS payload length captured
+    u64 cgroup_id;          // cgroup id of producing task; 0 when emitted via
+                            // legacy discovery path (PID not in traced_processes)
     char comm[TASK_COMM_LEN];
     u8 payload[DNS_PAYLOAD_MAX]; // raw DNS packet bytes (header + question)
 };

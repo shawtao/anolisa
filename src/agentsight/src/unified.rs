@@ -450,10 +450,21 @@ impl AgentSight {
             return None;
         }
 
-        // Handle UDP DNS events (domain-based attachment)
+        // Handle UDP DNS events: dual-channel consumption.
+        //
+        //   Channel B (discovery, legacy): cgroup_id == 0
+        //     → feed AgentScanner for domain-rule matching; on match,
+        //       attach SSL probes to the producing PID. Event is NOT
+        //       persisted (system-wide DNS noise).
+        //
+        //   Channel A (correlation, NEW): cgroup_id != 0
+        //     → fan-out to raw_events.db so PID/cgroup → domain reverse
+        //       lookup is available in containersight enrichment.
+        //       AgentScanner is still consulted (cheap, allows hybrid
+        //       cgroup-mode setups that also want domain-based attach).
         if let Event::UdpDns(ref dns_event) = event {
-            log::debug!("[UDP-DNS] pid={} comm={} domain={}",
-                dns_event.pid, dns_event.comm, dns_event.domain);
+            log::debug!("[UDP-DNS] pid={} comm={} domain={} cgroup_id={}",
+                dns_event.pid, dns_event.comm, dns_event.domain, dns_event.cgroup_id);
 
             if self.scanner.on_dns_event(dns_event.pid, &dns_event.domain) {
                 log::info!("[UDP-DNS] Attaching to pid={} via domain rule (domain={})",
@@ -461,6 +472,14 @@ impl AgentSight {
                 if let Err(e) = self.probes.attach_process(dns_event.pid as i32) {
                     log::warn!("[UDP-DNS] Failed to attach to pid={}: {}", dns_event.pid, e);
                 }
+            }
+
+            // Correlation channel: persist only events admitted via cgroup_filter
+            // so raw_events.db stays scoped to monitored containers.
+            if dns_event.cgroup_id != 0 && self.has_raw_sink() {
+                let ppid = self.pid_table.lookup_ppid(dns_event.pid);
+                let raw = crate::raw_event::RawEvent::from_udpdns(dns_event, ppid);
+                self.fanout_raw(raw);
             }
             return None;
         }

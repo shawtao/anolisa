@@ -206,11 +206,21 @@ impl Probes {
             None
         };
 
-        // Optionally create udpdns - it reuses traced_processes map and ring buffer
-        // Skips already-traced processes to avoid redundant discovery events
+        // Optionally create udpdns - it reuses traced_processes map, ring buffer
+        // and (when enabled) the cgroup_filter map.
+        //
+        // Dual-channel admission:
+        //   - Channel A (correlation): cgroup_id ∈ cgroup_filter → emit with cgroup_id
+        //   - Channel B (discovery):   PID ∉ traced_processes  → emit with cgroup_id=0
+        // When cgroup_filter is unset, only channel B fires (legacy behaviour).
         let udpdns = if enable_udpdns {
-            let dns = UdpDns::new_with_maps(&map_handle, &rb_handle)
-                .context("failed to create udpdns")?;
+            let dns = UdpDns::new_with_full_maps(
+                &map_handle,
+                &rb_handle,
+                cgroup_filter_ref,
+                cgroup_filter_enabled,
+            )
+            .context("failed to create udpdns")?;
             Some(dns)
         } else {
             log::info!("UDP DNS probe disabled (no domain_rules configured)");

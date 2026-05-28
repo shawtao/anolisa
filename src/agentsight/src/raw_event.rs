@@ -9,6 +9,7 @@ use crate::probes::procfs::ProcFsEvent;
 use crate::probes::procnet::ProcNetEvent;
 use crate::probes::procsig::ProcSigEvent;
 use crate::probes::proctrace::ProcEventHeader;
+use crate::probes::udpdns::UdpDnsEvent;
 
 use std::net::Ipv4Addr;
 
@@ -247,6 +248,34 @@ impl RawEvent {
             comm: e.comm.clone(),
             cgroup_id: e.cgroup_id,
             op: "write".to_owned(),
+            ret: 0,
+            data_json: data_json.to_string(),
+            count: 1,
+        }
+    }
+
+    /// Convert a UdpDnsEvent into a RawEvent.
+    ///
+    /// Only intended for the cgroup-filter "correlation" channel (cgroup_id != 0).
+    /// Discovery-channel events (cgroup_id == 0) are still consumed by the
+    /// AgentScanner in unified.rs and MUST NOT be persisted via this path,
+    /// otherwise raw_events.db would be polluted with system-wide DNS noise.
+    pub fn from_udpdns(e: &UdpDnsEvent, ppid: u32) -> Self {
+        let data_json = serde_json::json!({
+            "domain": e.domain,
+        });
+
+        Self {
+            id: None,
+            timestamp_ms: ns_to_unix_ms(e.timestamp_ns),
+            source: "udpdns".to_owned(),
+            pid: e.pid,
+            ppid,
+            tid: e.tid,
+            uid: e.uid,
+            comm: e.comm.clone(),
+            cgroup_id: e.cgroup_id,
+            op: "dns_query".to_owned(),
             ret: 0,
             data_json: data_json.to_string(),
             count: 1,
