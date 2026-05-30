@@ -7,6 +7,8 @@ use crate::probes::udpdns::UdpDnsEvent;
 use crate::probes::procfs::ProcFsEvent;
 use crate::probes::procnet::ProcNetEvent;
 use crate::probes::procsig::ProcSigEvent;
+use crate::probes::tcpdiag::TcpDiagEvent;
+use crate::probes::raw_aggregator::tcp::TcpDerivedEvent;
 
 /// Unified event type that can represent any probe event
 ///
@@ -22,6 +24,8 @@ pub enum Event {
     ProcFs(ProcFsEvent),
     ProcNet(ProcNetEvent),
     ProcSig(ProcSigEvent),
+    TcpDiag(TcpDiagEvent),
+    TcpDiagDerived(TcpDerivedEvent),
 }
 
 impl Event {
@@ -37,6 +41,8 @@ impl Event {
             Event::ProcFs(_) => "ProcFs",
             Event::ProcNet(_) => "ProcNet",
             Event::ProcSig(_) => "ProcSig",
+            Event::TcpDiag(_) => "TcpDiag",
+            Event::TcpDiagDerived(_) => "TcpDiagDerived",
         }
     }
 }

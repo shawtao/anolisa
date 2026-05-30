@@ -25,6 +25,7 @@ typedef enum {
     EVENT_SOURCE_PROCFS = 7,   // Filesystem operations
     EVENT_SOURCE_PROCNET = 8,  // Network operations
     EVENT_SOURCE_PROCSIG = 9,  // Signal/process control operations
+    EVENT_SOURCE_TCPDIAG = 10, // TCP stack-level diagnostic events (tcpdiag)
 } event_source_t;
 
 // Common event header - every ringbuffer event MUST start with this

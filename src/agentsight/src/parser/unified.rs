@@ -144,6 +144,8 @@ impl Parser {
             Event::ProcFs(_) => ParseResult { messages: Vec::new() },
             Event::ProcNet(_) => ParseResult { messages: Vec::new() },
             Event::ProcSig(_) => ParseResult { messages: Vec::new() },
+            Event::TcpDiag(_) => ParseResult { messages: Vec::new() },
+            Event::TcpDiagDerived(_) => ParseResult { messages: Vec::new() },
         }
     }
 

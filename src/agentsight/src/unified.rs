@@ -525,6 +525,35 @@ impl AgentSight {
             }
             return None;
         }
+        // TcpDiag base events: forwarded verbatim to the raw_events sink so
+        // operators can inspect retransmits / RSTs without running them
+        // through the parser/aggregator pipeline.
+        if let Event::TcpDiag(ref e) = event {
+            log::debug!(
+                "TcpDiag: pid={} comm={} op={} cookie={} cgroup_id={} family={}",
+                e.pid, e.comm, e.op_name(), e.sock_cookie, e.cgroup_id,
+                e.family_name()
+            );
+            if self.has_raw_sink() {
+                let ppid = self.pid_table.lookup_ppid(e.pid);
+                let raw = crate::raw_event::RawEvent::from_tcpdiag(e, ppid);
+                self.fanout_raw(raw);
+            }
+            return None;
+        }
+        // TcpDiagDerived: HighRetrans synthesized by the user-space
+        // TcpAggregator. Treated identically to a base event from the
+        // sink's perspective.
+        if let Event::TcpDiagDerived(ref d) = event {
+            log::debug!("TcpDiagDerived: {}", d.op_name());
+            if self.has_raw_sink() {
+                let crate::probes::raw_aggregator::tcp::TcpDerivedEvent::HighRetrans { pid, .. } = d;
+                let ppid = self.pid_table.lookup_ppid(*pid);
+                let raw = crate::raw_event::RawEvent::from_tcpdiag_derived(d, ppid);
+                self.fanout_raw(raw);
+            }
+            return None;
+        }
 
         // ProcTrace exec/exit fan-out to raw channel + PidTable update.
         // This runs BEFORE parse_event so that PidTable is populated for

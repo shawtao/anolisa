@@ -8,6 +8,8 @@ pub mod udpdns;
 pub mod procfs;
 pub mod procnet;
 pub mod procsig;
+pub mod raw_aggregator;
+pub mod tcpdiag;
 pub mod probes;
 
 // Re-export commonly used types
@@ -21,3 +23,5 @@ pub use udpdns::{UdpDns, UdpDnsEvent};
 pub use procfs::{ProcFsProbe, ProcFsEvent};
 pub use procnet::{ProcNetProbe, ProcNetEvent};
 pub use procsig::{ProcSigProbe, ProcSigEvent};
+pub use tcpdiag::{TcpDiagProbe, TcpDiagEvent};
+pub use raw_aggregator::{OpenErrAggregator, TcpAggregator, TcpAggregatorConfig, TcpDerivedEvent};

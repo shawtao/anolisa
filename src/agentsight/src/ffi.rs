@@ -734,7 +734,11 @@ fn ffi_background_thread(
     let mut sight = match AgentSight::new(config, raw_event_sender) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("agentsight background thread: AgentSight::new failed: {}", e);
+            // {:#} expands anyhow cause chain so callers see the real root
+            // cause (e.g. `failed to create udpdns: open() failed: ...`)
+            // rather than only the top-level "Failed to create probes".
+            log::error!("agentsight background thread: AgentSight::new failed: {:#}", e);
+            set_last_error(&format!("AgentSight::new failed: {:#}", e));
             return;
         }
     };

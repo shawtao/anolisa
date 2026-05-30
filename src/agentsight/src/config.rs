@@ -135,6 +135,7 @@ pub struct ProbeConfig {
     pub procfs: bool,         // default: false
     pub procnet: bool,        // default: false
     pub procsig: bool,        // default: false
+    pub tcpdiag: bool,        // default: false (gated rollout)
 }
 
 impl Default for ProbeConfig {
@@ -148,6 +149,7 @@ impl Default for ProbeConfig {
             procfs: false,
             procnet: false,
             procsig: false,
+            tcpdiag: false,
         }
     }
 }
@@ -204,6 +206,8 @@ struct JsonProbes {
     procnet: Option<bool>,
     #[serde(default)]
     procsig: Option<bool>,
+    #[serde(default)]
+    tcpdiag: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -640,6 +644,9 @@ impl AgentsightConfig {
             }
             if let Some(v) = jp.procsig {
                 pc.procsig = v;
+            }
+            if let Some(v) = jp.tcpdiag {
+                pc.tcpdiag = v;
             }
             self.probe_config = pc;
         }

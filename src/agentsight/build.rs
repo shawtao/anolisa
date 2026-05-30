@@ -70,6 +70,10 @@ fn main() {
     generate_skeleton(&mut out, "procsig");
     generate_header(&mut out, "procsig");
 
+    // Generate tcpdiag skeleton and bindings
+    generate_skeleton(&mut out, "tcpdiag");
+    generate_header(&mut out, "tcpdiag");
+
     // generate_header(&mut out, "frametypes");
     // generate_header(&mut out, "errors");
     // generate_header(&mut out, "stackdeltatypes");

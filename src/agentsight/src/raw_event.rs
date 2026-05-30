@@ -9,9 +9,11 @@ use crate::probes::procfs::ProcFsEvent;
 use crate::probes::procnet::ProcNetEvent;
 use crate::probes::procsig::ProcSigEvent;
 use crate::probes::proctrace::ProcEventHeader;
+use crate::probes::raw_aggregator::tcp::TcpDerivedEvent;
+use crate::probes::tcpdiag::TcpDiagEvent;
 use crate::probes::udpdns::UdpDnsEvent;
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Unified raw event stored in raw_events.db.
 ///
@@ -280,5 +282,97 @@ impl RawEvent {
             data_json: data_json.to_string(),
             count: 1,
         }
+    }
+
+    /// Convert a base TcpDiagEvent (RETRANSMIT / RESET_RECV) into a RawEvent.
+    pub fn from_tcpdiag(e: &TcpDiagEvent, ppid: u32) -> Self {
+        let saddr_str = format_addr(e.family, &e.saddr);
+        let daddr_str = format_addr(e.family, &e.daddr);
+
+        let data_json = serde_json::json!({
+            "sock_cookie": e.sock_cookie,
+            "family": e.family_name(),
+            "saddr": saddr_str,
+            "sport": e.sport,
+            "daddr": daddr_str,
+            "dport": e.dport,
+            "segs_out": e.segs_out,
+            "total_retrans": e.total_retrans,
+        });
+
+        Self {
+            id: None,
+            timestamp_ms: ns_to_unix_ms(e.timestamp_ns),
+            source: "tcpdiag".to_owned(),
+            pid: e.pid,
+            ppid,
+            tid: 0,
+            uid: 0,
+            comm: e.comm.clone(),
+            cgroup_id: e.cgroup_id,
+            op: e.op_name().to_owned(),
+            ret: 0,
+            data_json: data_json.to_string(),
+            count: 1,
+        }
+    }
+
+    /// Convert a derived TcpDerivedEvent (HighRetrans) into a RawEvent.
+    /// `count` carries burst size for HighRetrans.
+    pub fn from_tcpdiag_derived(e: &TcpDerivedEvent, ppid: u32) -> Self {
+        match e {
+            TcpDerivedEvent::HighRetrans {
+                cookie, cgroup_id, pid, comm, timestamp_ns,
+                family, sport, dport, saddr, daddr,
+                retrans_count, window_ms, total_retrans,
+            } => {
+                let saddr_str = format_addr(*family, saddr);
+                let daddr_str = format_addr(*family, daddr);
+                let data_json = serde_json::json!({
+                    "sock_cookie": cookie,
+                    "family": format_family(*family),
+                    "saddr": saddr_str,
+                    "sport": sport,
+                    "daddr": daddr_str,
+                    "dport": dport,
+                    "retrans_count": retrans_count,
+                    "window_ms": window_ms,
+                    "total_retrans": total_retrans,
+                });
+                Self {
+                    id: None,
+                    timestamp_ms: ns_to_unix_ms(*timestamp_ns),
+                    source: "tcpdiag".to_owned(),
+                    pid: *pid,
+                    ppid,
+                    tid: 0,
+                    uid: 0,
+                    comm: comm.clone(),
+                    cgroup_id: *cgroup_id,
+                    op: "tcp_high_retrans".to_owned(),
+                    ret: 0,
+                    data_json: data_json.to_string(),
+                    count: *retrans_count as u64,
+                }
+            }
+        }
+    }
+}
+
+fn format_addr(family: u16, raw: &[u8; 16]) -> String {
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 10;
+    match family {
+        AF_INET => Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]).to_string(),
+        AF_INET6 => Ipv6Addr::from(*raw).to_string(),
+        _ => String::new(),
+    }
+}
+
+fn format_family(family: u16) -> &'static str {
+    match family {
+        2  => "AF_INET(IPv4)",
+        10 => "AF_INET6(IPv6)",
+        _  => "AF_UNKNOWN",
     }
 }

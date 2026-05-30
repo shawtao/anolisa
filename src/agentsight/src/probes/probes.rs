@@ -23,9 +23,12 @@ use super::procmon::{ProcMon, ProcMonEvent};
 use super::filewatch::{FileWatch, RawFileWatchEvent};
 use super::filewrite::{FileWrite as FileWriteProbe, RawFileWriteEvent};
 use super::udpdns::{UdpDns, RawUdpDnsEvent};
-use super::procfs::{OpenErrAggregator, ProcFsProbe, ProcFsEvent, RawProcFsEvent};
+use super::raw_aggregator::OpenErrAggregator;
+use super::procfs::{ProcFsProbe, ProcFsEvent, RawProcFsEvent};
 use super::procnet::{ProcNetProbe, ProcNetEvent, RawProcNetEvent};
 use super::procsig::{ProcSigProbe, ProcSigEvent, RawProcSigEvent};
+use super::tcpdiag::{TcpDiagProbe, TcpDiagEvent, RawTcpDiagEvent};
+use super::raw_aggregator::{TcpAggregator, TcpAggregatorConfig};
 
 const POLL_TIMEOUT_MS: u64 = 100;
 
@@ -39,6 +42,7 @@ const EVENT_SOURCE_UDPDNS: u32 = 6;
 const EVENT_SOURCE_PROCFS: u32 = 7;
 const EVENT_SOURCE_PROCNET: u32 = 8;
 const EVENT_SOURCE_PROCSIG: u32 = 9;
+const EVENT_SOURCE_TCPDIAG: u32 = 10;
 
 /// Unified probe manager that coordinates sslsniff and proctrace
 /// 
@@ -66,6 +70,8 @@ pub struct Probes {
     procnet: Option<ProcNetProbe>,
     /// Signal/process control probe (optional)
     procsig: Option<ProcSigProbe>,
+    /// TCP stack diagnostic probe (optional)
+    tcpdiag: Option<TcpDiagProbe>,
     /// User-space aggregator for OPEN failures (optional, see procfs.rs).
     /// Shared between the ringbuf callback and the flush thread.
     open_err_agg: Option<Arc<OpenErrAggregator>>,
@@ -281,6 +287,25 @@ impl Probes {
             None
         };
 
+        // Optionally create tcpdiag - reuses traced_processes / rb / cgroup_filter.
+        // Owns its own user-space TcpAggregator that turns base events into
+        // HighRetrans derived events.
+        let tcpdiag = if probe_config.tcpdiag {
+            Some(
+                TcpDiagProbe::new_with_full_maps(
+                    &map_handle,
+                    &rb_handle,
+                    cgroup_filter_ref,
+                    cgroup_filter_enabled,
+                    TcpAggregatorConfig::default(),
+                )
+                .context("failed to create tcpdiag probe")?,
+            )
+        } else {
+            log::info!("TcpDiag probe disabled by config");
+            None
+        };
+
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
         // Install OPEN-error aggregator whenever procfs is on. Python importlib
@@ -303,6 +328,7 @@ impl Probes {
             procfs,
             procnet,
             procsig,
+            tcpdiag,
             open_err_agg,
             rb_handle,
             event_tx,
@@ -343,6 +369,10 @@ impl Probes {
         if let Some(ref mut p) = self.procsig {
             p.attach().context("failed to attach procsig")?;
         }
+        // Attach tcpdiag (TCP stack diagnostics) if enabled
+        if let Some(ref mut p) = self.tcpdiag {
+            p.attach().context("failed to attach tcpdiag")?;
+        }
         // sslsniff uses uprobes attached per-process via attach_process()
         Ok(())
     }
@@ -377,6 +407,7 @@ impl Probes {
         let procfs_event_size = mem::size_of::<RawProcFsEvent>();
         let procnet_event_size = mem::size_of::<RawProcNetEvent>();
         let procsig_event_size = mem::size_of::<RawProcSigEvent>();
+        let tcpdiag_event_size = mem::size_of::<RawTcpDiagEvent>();
 
         // Capture probe-enabled flags so the poller closure (`move`) can skip
         // events from disabled probes without holding a reference to `self`.
@@ -389,14 +420,18 @@ impl Probes {
         let has_procfs = self.procfs.is_some();
         let has_procnet = self.procnet.is_some();
         let has_procsig = self.procsig.is_some();
+        let has_tcpdiag = self.tcpdiag.is_some();
 
         let event_tx = self.event_tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_inner = Arc::clone(&stop_flag);
 
-        // Clone the aggregator handle for the ringbuf callback closure; the
-        // flush thread uses a second clone below.
+        // Clone the aggregator handle for the ringbuf callback closure.
         let open_err_agg_cb = self.open_err_agg.as_ref().map(Arc::clone);
+        // tcpdiag aggregator: shared by ringbuf callback (record base events ->
+        // immediate HighRetrans).
+        let tcpdiag_agg_cb: Option<Arc<TcpAggregator>> =
+            self.tcpdiag.as_ref().map(|p| p.aggregator());
 
         // Build ring buffer from the shared rb handle
         let mut rb_builder = RingBufferBuilder::new();
@@ -500,6 +535,25 @@ impl Probes {
                             None
                         }
                     }
+                    EVENT_SOURCE_TCPDIAG => {
+                        if !has_tcpdiag { return 0; }
+                        if data.len() >= tcpdiag_event_size {
+                            if let Some(e) = TcpDiagEvent::from_bytes(data) {
+                                // Pipe through aggregator first; an immediate
+                                // HighRetrans signal piggybacks on the same
+                                // base event payload so the user sees the
+                                // burst in the same poll cycle.
+                                if let Some(ref agg) = tcpdiag_agg_cb {
+                                    if let Some(d) = agg.record(&e.to_agg_input()) {
+                                        let _ = event_tx.send(Event::TcpDiagDerived(d));
+                                    }
+                                }
+                                let _ = event_tx.send(Event::TcpDiag(e));
+                            }
+                            return 0;
+                        }
+                        None
+                    }
                     _ => {
                         // Unknown source - ignore
                         log::warn!("probes: unknown event source {source}");
@@ -536,47 +590,19 @@ impl Probes {
             .context("failed to spawn poll thread")?;
 
         // Spawn flush thread for per-CPU aggregation maps (procnet/procsig/procfs).
-        // When re-enabling procfs write (#if 1 in procfs.bpf.c), restore:
-        //   let write_agg = self.procfs.as_ref().and_then(|p| p.write_agg_map_handle().ok());
-        //   if write_agg.is_some() || connect_agg... in the condition below, and
-        //   the flush_write_agg branch inside the loop (see block comment there).
         let connect_agg = self.procnet.as_ref().and_then(|p| p.connect_agg_map_handle().ok());
         let fork_agg = self.procsig.as_ref().and_then(|p| p.fork_agg_map_handle().ok());
         let open_agg = self.procfs.as_ref().and_then(|p| p.open_agg_map_handle().ok());
         let open_err_agg_flush = self.open_err_agg.as_ref().map(Arc::clone);
-        let flush_handle = if connect_agg.is_some() || fork_agg.is_some() || open_agg.is_some() || open_err_agg_flush.is_some() {
-            let flush_tx = self.event_tx.clone();
-            let flush_stop = Arc::clone(&stop_flag);
-            let interval = Duration::from_millis(flush_interval_ms.max(1));
-            let h = thread::Builder::new()
-                .name("probes-flush".into())
-                .spawn(move || {
-                    while !flush_stop.load(Ordering::Relaxed) {
-                        thread::sleep(interval);
-                        /*
-                        if let Some(ref m) = write_agg {
-                            super::procfs::flush_write_agg(m, &flush_tx);
-                        }
-                        */
-                        if let Some(ref m) = connect_agg {
-                            super::procnet::flush_connect_agg(m, &flush_tx);
-                        }
-                        if let Some(ref m) = fork_agg {
-                            super::procsig::flush_fork_agg(m, &flush_tx);
-                        }
-                        if let Some(ref m) = open_agg {
-                            super::procfs::flush_open_agg(m, &flush_tx);
-                        }
-                        if let Some(ref agg) = open_err_agg_flush {
-                            agg.flush(&flush_tx);
-                        }
-                    }
-                })
-                .context("failed to spawn flush thread")?;
-            Some(h)
-        } else {
-            None
-        };
+        let flush_handle = Self::spawn_flush_thread(
+            connect_agg,
+            fork_agg,
+            open_agg,
+            open_err_agg_flush,
+            self.event_tx.clone(),
+            Arc::clone(&stop_flag),
+            Duration::from_millis(flush_interval_ms.max(1)),
+        )?;
 
         Ok(ProbesPoller {
             handle: Some(handle),
@@ -628,6 +654,50 @@ impl Probes {
     pub fn remove_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
         self.proctrace.remove_traced_cgroup(cgroup_id)
             .context("failed to remove traced cgroup")
+    }
+
+    /// Spawn the periodic flush thread that drains per-CPU BPF aggregation
+    /// maps (connect/fork/open) and user-space folders (`OpenErrAggregator`).
+    /// Returns `Ok(None)` when no aggregation source is enabled, so the
+    /// caller can skip the join handle.
+    fn spawn_flush_thread(
+        connect_agg: Option<MapHandle>,
+        fork_agg: Option<MapHandle>,
+        open_agg: Option<MapHandle>,
+        open_err_agg: Option<Arc<OpenErrAggregator>>,
+        flush_tx: crossbeam_channel::Sender<Event>,
+        stop_flag: Arc<AtomicBool>,
+        interval: Duration,
+    ) -> Result<Option<thread::JoinHandle<()>>> {
+        if connect_agg.is_none()
+            && fork_agg.is_none()
+            && open_agg.is_none()
+            && open_err_agg.is_none()
+        {
+            return Ok(None);
+        }
+
+        let h = thread::Builder::new()
+            .name("probes-flush".into())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::sleep(interval);
+                    if let Some(ref m) = connect_agg {
+                        super::procnet::flush_connect_agg(m, &flush_tx);
+                    }
+                    if let Some(ref m) = fork_agg {
+                        super::procsig::flush_fork_agg(m, &flush_tx);
+                    }
+                    if let Some(ref m) = open_agg {
+                        super::procfs::flush_open_agg(m, &flush_tx);
+                    }
+                    if let Some(ref agg) = open_err_agg {
+                        agg.flush(&flush_tx);
+                    }
+                }
+            })
+            .context("failed to spawn flush thread")?;
+        Ok(Some(h))
     }
 }
 
