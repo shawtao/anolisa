@@ -136,6 +136,11 @@ pub struct ProbeConfig {
     pub procnet: bool,        // default: false
     pub procsig: bool,        // default: false
     pub tcpdiag: bool,        // default: false (gated rollout)
+    /// Capture stdout/stderr writes via proctrace's `trace_write_enter` hook.
+    /// default: true. Set false in raw/cgroup scenarios where stdout payloads
+    /// are not consumed (Stdout events never become RawEvents) to avoid the
+    /// high-frequency write(2) syscall path overhead.
+    pub proctrace_stdout: bool,
 }
 
 impl Default for ProbeConfig {
@@ -150,6 +155,7 @@ impl Default for ProbeConfig {
             procnet: false,
             procsig: false,
             tcpdiag: false,
+            proctrace_stdout: true,
         }
     }
 }
@@ -208,6 +214,8 @@ struct JsonProbes {
     procsig: Option<bool>,
     #[serde(default)]
     tcpdiag: Option<bool>,
+    #[serde(default)]
+    proctrace_stdout: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -647,6 +655,9 @@ impl AgentsightConfig {
             }
             if let Some(v) = jp.tcpdiag {
                 pc.tcpdiag = v;
+            }
+            if let Some(v) = jp.proctrace_stdout {
+                pc.proctrace_stdout = v;
             }
             self.probe_config = pc;
         }

@@ -766,4 +766,52 @@ int trace_writev_exit(struct trace_event_raw_sys_exit *ctx)
 }
 #endif
 
+/* ========== inotify_add_watch ==========
+ *
+ * Captures `inotify_add_watch(fd, pathname, mask)` failures, primarily
+ * ENOSPC raised when `fs.inotify.max_user_watches` (per-uid) or
+ * `fs.inotify.max_user_instances` is saturated. The success path is
+ * intentionally dropped in BPF because:
+ *  - One emit per registered watch dominates procfs volume in
+ *    tools that recursively watch large trees (vscode, watchman, ...).
+ *  - The watch descriptor returned on success is not actionable from
+ *    a containersight anomaly-detection standpoint.
+ *
+ * Reuses the existing saved_fs_args / temp_fs_args plumbing so that the
+ * pathname survives enter→exit pairing.
+ */
+
+static __always_inline int handle_inotify_add_watch_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    s32 ret = (s32)ctx->ret;
+
+    struct saved_fs_args *args = bpf_map_lookup_elem(&temp_fs_args, &pid_tgid);
+    if (!args)
+        return 0;
+
+    if (ret < 0) {
+        emit_fs_event(ctx, PROCFS_INOTIFY_ADD_WATCH, ret,
+                      args->path, sizeof(args->path),
+                      NULL, 0);
+    }
+
+    bpf_map_delete_elem(&temp_fs_args, &pid_tgid);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_inotify_add_watch")
+int trace_inotify_add_watch_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* args[0]=fd, args[1]=pathname, args[2]=mask */
+    return handle_single_path_enter((const char *)ctx->args[1],
+                                    PROCFS_INOTIFY_ADD_WATCH);
+}
+
+SEC("tp/syscalls/sys_exit_inotify_add_watch")
+int trace_inotify_add_watch_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return handle_inotify_add_watch_exit(ctx);
+}
+
 char LICENSE[] SEC("license") = "GPL";

@@ -2,7 +2,7 @@
 // Copyright (c) 2025 AgentSight Project
 //
 // Signal and process control probe header
-// Monitors setpgid, setsid, kill, fork
+// Monitors kill, fork, signal_generate (receiver-perspective)
 #ifndef __PROCSIG_H
 #define __PROCSIG_H
 
@@ -18,11 +18,11 @@ typedef signed long long    s64;
 typedef unsigned long long  u64;
 
 enum procsig_op {
-    PROCSIG_SETPGID    = 1,
-    PROCSIG_SETSID     = 2,
-    PROCSIG_KILL       = 3,
-    PROCSIG_FORK_FAIL  = 4,  // fork-family syscall failure (clone/clone3/vfork ret<0)
-    PROCSIG_FORK_AGG   = 5,
+    PROCSIG_KILL        = 3,
+    PROCSIG_FORK_FAIL   = 4,  // fork-family syscall failure (clone/clone3/vfork ret<0)
+    PROCSIG_FORK_AGG    = 5,
+    PROCSIG_SIGNAL_RECV = 6,  // signal_generate receiver-perspective event
+                              // (raw_tracepoint/signal_generate, covers OOM/SEGV/external kill)
 };
 
 // Single signal/process control event - sent via ringbuf

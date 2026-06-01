@@ -130,7 +130,7 @@ impl Probes {
     ) -> Result<Self> {
         // Create proctrace first - it owns the traced_processes map, the ring
         // buffer, and (when enabled) the cgroup_filter map.
-        let proctrace = ProcTrace::new_with_target_and_maps(
+        let mut proctrace = ProcTrace::new_with_target_and_maps(
             target_pids,
             target_uid,
             None,
@@ -138,6 +138,10 @@ impl Probes {
             cgroup_filter_enabled,
         )
         .context("failed to create proctrace")?;
+
+        // Apply stdout-capture preference before attach. When disabled (e.g. raw/
+        // cgroup scenarios), the high-frequency write(2) tracepoint is skipped.
+        proctrace.set_capture_stdout(probe_config.proctrace_stdout);
 
         // Get handles to the shared maps for reuse
         let map_handle = proctrace.traced_processes_handle()

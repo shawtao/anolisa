@@ -23,6 +23,9 @@ enum procnet_op {
     PROCNET_CONNECT_ERR      = 3,
     PROCNET_CONNECT_AGG      = 4,
     PROCNET_GETSOCKOPT_ERR   = 5,
+    PROCNET_SOCKET_ERR       = 6,   /* socket(2) failure, e.g. EMFILE/ENFILE.
+                                     * Success path is not emitted (would be too
+                                     * noisy and provides no diagnostic value). */
 };
 
 // Single network event - sent via ringbuf

@@ -2,7 +2,7 @@
 // Copyright (c) 2025 AgentSight Project
 //
 // Signal and process control BPF program
-// Traces: setpgid, setsid, kill, fork (sched_process_fork)
+// Traces: kill, fork (sched_process_fork), signal_generate (receiver-perspective)
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
@@ -70,76 +70,6 @@ static __always_inline void emit_sig_event(u32 op, s32 ret,
     event->signal = signal;
 
     bpf_ringbuf_submit(event, 0);
-}
-
-/* ========== setpgid ========== */
-
-SEC("tp/syscalls/sys_enter_setpgid")
-int trace_setpgid_enter(struct trace_event_raw_sys_enter *ctx)
-{
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-
-    u64 cg_id;
-    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
-        return 0;
-
-    struct saved_sig_args args = {};
-    args.op = PROCSIG_SETPGID;
-    args.target_pid = (u32)ctx->args[0]; /* pid argument */
-
-    bpf_map_update_elem(&temp_sig_args, &pid_tgid, &args, BPF_ANY);
-    return 0;
-}
-
-SEC("tp/syscalls/sys_exit_setpgid")
-int trace_setpgid_exit(struct trace_event_raw_sys_exit *ctx)
-{
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-
-    struct saved_sig_args *args = bpf_map_lookup_elem(&temp_sig_args, &pid_tgid);
-    if (!args)
-        return 0;
-
-    emit_sig_event(args->op, (s32)ctx->ret, args->target_pid, 0);
-
-    bpf_map_delete_elem(&temp_sig_args, &pid_tgid);
-    return 0;
-}
-
-/* ========== setsid ========== */
-
-SEC("tp/syscalls/sys_enter_setsid")
-int trace_setsid_enter(struct trace_event_raw_sys_enter *ctx)
-{
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 pid = pid_tgid >> 32;
-
-    u64 cg_id;
-    if (!traced_pid_cgroup_gate_allow(pid, &cg_id))
-        return 0;
-
-    struct saved_sig_args args = {};
-    args.op = PROCSIG_SETSID;
-    /* setsid takes no arguments */
-
-    bpf_map_update_elem(&temp_sig_args, &pid_tgid, &args, BPF_ANY);
-    return 0;
-}
-
-SEC("tp/syscalls/sys_exit_setsid")
-int trace_setsid_exit(struct trace_event_raw_sys_exit *ctx)
-{
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-
-    struct saved_sig_args *args = bpf_map_lookup_elem(&temp_sig_args, &pid_tgid);
-    if (!args)
-        return 0;
-
-    emit_sig_event(args->op, (s32)ctx->ret, 0, 0);
-
-    bpf_map_delete_elem(&temp_sig_args, &pid_tgid);
-    return 0;
 }
 
 /* ========== kill ========== */
@@ -266,6 +196,77 @@ SEC("tp/syscalls/sys_exit_fork")
 int trace_fork_exit(struct trace_event_raw_sys_exit *ctx)
 {
     return handle_fork_fail((s32)ctx->ret);
+}
+
+/* ========== signal_generate — receiver-perspective signal capture ==========
+ *
+ * Covers ALL signal sources (kill/tgkill/OOM killer/SIGSEGV/SIGBUS/abort)
+ * by hooking the kernel's unified signal posting path (__send_signal).
+ *
+ * Uses raw_tracepoint to access TP_PROTO's task_struct pointer directly,
+ * enabling CO-RE reads of receiver's cgroup_id for container-aware filtering
+ * even when sender (current) is outside the tracked container.
+ *
+ * TP_PROTO(int sig, struct kernel_siginfo *info,
+ *          struct task_struct *task, int group, int result)
+ */
+
+/* Signal whitelist — only fatal/crash signals, no SIGTERM/SIGQUIT */
+#define SIG_KILL_NUM  9
+#define SIG_ABRT_NUM  6
+#define SIG_SEGV_NUM  11
+#define SIG_BUS_NUM   7
+
+SEC("raw_tracepoint/signal_generate")
+int trace_signal_generate(struct bpf_raw_tracepoint_args *ctx)
+{
+    int sig    = (int)ctx->args[0];
+    /* args[1] = struct kernel_siginfo *info */
+    struct task_struct *task = (struct task_struct *)ctx->args[2];
+    /* args[3] = int group */
+    int result = (int)ctx->args[4];
+
+    /* Filter 1: only TRACE_SIGNAL_DELIVERED (result == 0) */
+    if (result != 0)
+        return 0;
+
+    /* Filter 2: signal whitelist — SIGKILL/SIGABRT/SIGSEGV/SIGBUS only */
+    if (sig != SIG_KILL_NUM && sig != SIG_ABRT_NUM &&
+        sig != SIG_SEGV_NUM && sig != SIG_BUS_NUM)
+        return 0;
+
+    /* Filter 3: receiver task must be in a tracked container cgroup */
+    u64 cg_id;
+    if (!target_task_gate_allow(task, &cg_id))
+        return 0;
+
+    /* Receiver info from task_struct (CO-RE) */
+    u32 receiver_tgid = BPF_CORE_READ(task, tgid);
+    u32 receiver_tid  = BPF_CORE_READ(task, pid);  /* kernel pid = userspace tid */
+
+    /* Sender info from current (whoever triggered __send_signal) */
+    u64 sender_pid_tgid = bpf_get_current_pid_tgid();
+    u32 sender_tgid     = sender_pid_tgid >> 32;
+
+    /* Emit event */
+    struct procsig_event *event = bpf_ringbuf_reserve(&rb, sizeof(*event), 0);
+    if (!event)
+        return 0;
+
+    event->source       = EVENT_SOURCE_PROCSIG;
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid          = receiver_tgid;    /* receiver perspective */
+    event->tid          = receiver_tid;
+    event->uid          = BPF_CORE_READ(task, cred, uid.val);
+    event->cgroup_id    = cg_id;            /* receiver's cgroup */
+    event->op           = PROCSIG_SIGNAL_RECV;
+    event->ret          = 0;                /* no syscall ret semantics */
+    BPF_CORE_READ_STR_INTO(&event->comm, task, comm);
+    event->target_pid   = sender_tgid;      /* reuse field for sender */
+    event->signal       = (u32)sig;
+
+    bpf_ringbuf_submit(event, 0);
+    return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

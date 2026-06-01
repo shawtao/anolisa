@@ -34,6 +34,12 @@ enum procfs_op {
     PROCFS_RMDIR     = 9,   /* legacy rmdir(2): kept distinct from PROCFS_DELETE so that
                              * "remove directory" vs "unlink file" are not conflated.
                              */
+    PROCFS_INOTIFY_ADD_WATCH = 10, /* inotify_add_watch(2) failure path; success is dropped
+                                    * in BPF (one event per registered watch is too noisy
+                                    * and provides no diagnostic value — only ENOSPC
+                                    * caused by fs.inotify.max_user_watches saturation
+                                    * matters).
+                                    */
 };
 
 // Single filesystem event - sent via ringbuf

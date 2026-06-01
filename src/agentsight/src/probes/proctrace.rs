@@ -338,6 +338,11 @@ pub struct ProcTrace {
     _links: Vec<Link>,
     tx: crossbeam_channel::Sender<VariableEvent>,
     rx: crossbeam_channel::Receiver<VariableEvent>,
+    /// When false, the `trace_write_enter` (stdout/stderr) tracepoint is NOT
+    /// attached. Stdout events never become RawEvents, so in raw/cgroup
+    /// scenarios this avoids the high-frequency write(2) syscall path overhead.
+    /// Defaults to true to preserve prior behavior.
+    capture_stdout: bool,
 }
 
 impl ProcTrace {
@@ -448,6 +453,7 @@ impl ProcTrace {
             _links: Vec::new(),
             tx,
             rx,
+            capture_stdout: true,
         })
     }
 
@@ -530,6 +536,15 @@ impl ProcTrace {
         MapHandle::try_clone(map).context("failed to create MapHandle from rb")
     }
 
+    /// Enable or disable stdout/stderr capture (the `trace_write_enter` hook).
+    ///
+    /// Must be called before `attach()`. When set to false, the write(2)
+    /// tracepoint is skipped entirely, eliminating the high-frequency syscall
+    /// path overhead in scenarios that do not consume stdout payloads.
+    pub fn set_capture_stdout(&mut self, enabled: bool) {
+        self.capture_stdout = enabled;
+    }
+
     /// Attach tracepoints for process tracking
     pub fn attach(&mut self) -> Result<()> {
         let mut links = Vec::new();
@@ -552,14 +567,19 @@ impl ProcTrace {
             .context("failed to attach execve exit tracepoint")?;
         links.push(link);
 
-        // Attach write tracepoint (for stdout capture)
-        let link = self
-            .skel
-            .progs_mut()
-            .trace_write_enter()
-            .attach()
-            .context("failed to attach write tracepoint")?;
-        links.push(link);
+        // Attach write tracepoint (for stdout capture). Skipped when stdout
+        // capture is disabled to avoid the high-frequency write(2) syscall path.
+        if self.capture_stdout {
+            let link = self
+                .skel
+                .progs_mut()
+                .trace_write_enter()
+                .attach()
+                .context("failed to attach write tracepoint")?;
+            links.push(link);
+        } else {
+            log::info!("proctrace: stdout/stderr capture disabled (trace_write_enter not attached)");
+        }
 
         // Attach process exit tracepoint
         let link = self

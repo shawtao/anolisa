@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 // Copyright (c) 2025 AgentSight Project
 //
-// Signal and process control probe - monitors setpgid, setsid, kill, fork
+// Signal and process control probe - monitors kill, fork, signal_generate
 
 use crate::config;
 use anyhow::{Context, Result};
@@ -47,11 +47,10 @@ impl ProcSigEvent {
     /// Human-readable operation name
     pub fn op_name(&self) -> &'static str {
         match self.op {
-            1 => "setpgid",
-            2 => "setsid",
             3 => "kill",
             4 => "fork_fail",  // fork-family syscall failure (clone/clone3/vfork ret<0)
             5 => "fork",
+            6 => "signal_recv",  // raw_tracepoint/signal_generate receiver-perspective
             _ => "unknown",
         }
     }
@@ -139,7 +138,7 @@ impl ProcSigProbe {
         errors_only: bool,
     ) -> Result<Self> {
         // `errors_only` only drives rodata-based suppression of success events for
-        // setpgid/setsid/kill/fork. Fork-failure capture (clone/clone3/vfork
+        // kill/fork. Fork-failure capture (clone/clone3/vfork
         // sys_exit) is always attached in attach() below.
         let mut builder = ProcsigSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
@@ -197,26 +196,6 @@ impl ProcSigProbe {
     pub fn attach(&mut self) -> Result<()> {
         let mut links = Vec::new();
 
-        // setpgid enter/exit
-        links.push(
-            self.skel.progs_mut().trace_setpgid_enter().attach()
-                .context("failed to attach trace_setpgid_enter")?,
-        );
-        links.push(
-            self.skel.progs_mut().trace_setpgid_exit().attach()
-                .context("failed to attach trace_setpgid_exit")?,
-        );
-
-        // setsid enter/exit
-        links.push(
-            self.skel.progs_mut().trace_setsid_enter().attach()
-                .context("failed to attach trace_setsid_enter")?,
-        );
-        links.push(
-            self.skel.progs_mut().trace_setsid_exit().attach()
-                .context("failed to attach trace_setsid_exit")?,
-        );
-
         // kill enter/exit
         links.push(
             self.skel.progs_mut().trace_kill_enter().attach()
@@ -259,6 +238,17 @@ impl ProcSigProbe {
             ),
         }
         log::info!("procsig: fork-failure capture enabled (clone/clone3/vfork/fork sys_exit; always-on)");
+
+        // signal_generate — raw tracepoint, receiver-perspective.
+        // Captures SIGKILL/SIGABRT/SIGSEGV/SIGBUS delivered to tracked container
+        // processes, regardless of sender location (covers OOM killer, docker stop,
+        // hardware exceptions, tgkill-based abort).
+        links.push(
+            self.skel.progs_mut().trace_signal_generate()
+                .attach_raw_tracepoint("signal_generate")
+                .context("failed to attach raw_tracepoint/signal_generate")?,
+        );
+        log::info!("procsig: signal_generate raw_tracepoint attached (receiver-perspective signal capture)");
 
         self._links = links;
         Ok(())

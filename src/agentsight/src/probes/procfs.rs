@@ -59,6 +59,7 @@ impl ProcFsEvent {
             7 => "write",
             8 => "open",
             9 => "rmdir",
+            10 => "inotify_add_watch",
             _ => "unknown",
         }
     }
@@ -391,6 +392,20 @@ impl ProcFsProbe {
         try_attach(
             self.skel.progs_mut().trace_rename_exit().attach().map_err(Into::into),
             "sys_exit_rename",
+            &mut links,
+        );
+
+        // inotify_add_watch enter/exit — tracepoint exists on Linux >= 5.7
+        // (older kernels expose only the kprobe entry point). Wrap with
+        // try_attach so a missing tracepoint does not abort probe startup.
+        try_attach(
+            self.skel.progs_mut().trace_inotify_add_watch_enter().attach().map_err(Into::into),
+            "sys_enter_inotify_add_watch",
+            &mut links,
+        );
+        try_attach(
+            self.skel.progs_mut().trace_inotify_add_watch_exit().attach().map_err(Into::into),
+            "sys_exit_inotify_add_watch",
             &mut links,
         );
 

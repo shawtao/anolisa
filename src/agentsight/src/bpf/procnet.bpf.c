@@ -382,4 +382,29 @@ int trace_getsockopt_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
+/* ========== socket ==========
+ *
+ * socket(2) is a 0-arg-of-interest probe: domain/type/protocol carry no
+ * diagnostic value for the resource-exhaustion path. We attach only at
+ * sys_exit and emit ONLY on failure (ret < 0), e.g. EMFILE / ENFILE. The
+ * success path is intentionally dropped to avoid swamping the ring buffer
+ * with one event per socket() call — socket() runs on every TCP/UDP/UDS
+ * setup and would dominate procnet's volume.
+ */
+
+SEC("tp/syscalls/sys_exit_socket")
+int trace_socket_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    s32 ret = (s32)ctx->ret;
+
+    /* Errors-only by design — see comment above. */
+    if (ret >= 0)
+        return 0;
+
+    /* port/addr/family are unknown at socket() time and stay zero. */
+    struct saved_net_args args = {};
+    emit_net_event(PROCNET_SOCKET_ERR, ret, &args);
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

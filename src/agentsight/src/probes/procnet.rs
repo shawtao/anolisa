@@ -56,6 +56,7 @@ impl ProcNetEvent {
             3 => "connect_error",
             4 => "connect",
             5 => "getsockopt_error",
+            6 => "socket_error",
             _ => "unknown",
         }
     }
@@ -257,6 +258,14 @@ impl ProcNetProbe {
         links.push(
             self.skel.progs_mut().trace_getsockopt_exit().attach()
                 .context("failed to attach trace_getsockopt_exit")?,
+        );
+
+        // socket exit only — we emit on failure (EMFILE/ENFILE) without
+        // pairing enter/exit; success path is dropped in BPF to avoid
+        // ringbuf saturation on every TCP/UDP/UDS socket setup.
+        links.push(
+            self.skel.progs_mut().trace_socket_exit().attach()
+                .context("failed to attach trace_socket_exit")?,
         );
 
         self._links = links;

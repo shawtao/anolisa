@@ -205,4 +205,62 @@ static __always_inline int traced_pid_cgroup_gate_allow(u32 traced_map_pid, u64 
 #endif
 }
 
+/*
+ * get_task_cgroup_id - Get cgroup inode ID for an **arbitrary** task_struct.
+ *
+ * Unlike get_cgroup_id_compat() which only works for `current`, this function
+ * accepts any task_struct pointer (e.g. from raw_tracepoint arguments) and
+ * performs CO-RE reads to extract the memory-controller cgroup's kernfs id.
+ *
+ * In cgroup v2 unified hierarchy, subsys[MEMORY]->cgroup is the same as the
+ * default cgroup, so kn->id matches bpf_get_current_cgroup_id() semantics.
+ */
+static __always_inline u64 get_task_cgroup_id(struct task_struct *task)
+{
+    if (!task)
+        return 0;
+
+    struct cgroup_subsys_state *css = BPF_CORE_READ(task, cgroups,
+                                                     subsys[CGRP_SUBSYS_MEMORY]);
+    if (!css)
+        return 0;
+
+    struct cgroup *cgrp = BPF_CORE_READ(css, cgroup);
+    if (!cgrp)
+        return 0;
+
+    struct kernfs_node *kn = BPF_CORE_READ(cgrp, kn);
+    return __read_kn_id(kn);
+}
+
+/*
+ * target_task_gate_allow — "PID listed OR cgroup allowed" admission for an
+ * arbitrary task_struct (not necessarily current).
+ *
+ * Used by raw_tracepoint probes (e.g. signal_generate) where the event target
+ * is NOT the currently executing task.  Reads tgid and cgroup_id from the
+ * provided task pointer via CO-RE.
+ *
+ * @task: target task_struct pointer (from raw_tracepoint ctx->args[]).
+ * @cg_id_out: filled with get_task_cgroup_id(task).
+ * Returns 1 to continue the probe, 0 to drop.
+ */
+static __always_inline int target_task_gate_allow(struct task_struct *task, u64 *cg_id_out)
+{
+    u32 tgid = BPF_CORE_READ(task, tgid);
+    u32 *val = bpf_map_lookup_elem(&traced_processes, &tgid);
+    int pid_allow = val ? 1 : 0;
+
+    u64 cg_id = get_task_cgroup_id(task);
+    *cg_id_out = cg_id;
+
+#ifndef NO_CGROUP_FILTER
+    if (!filter_cgroup_enabled)
+        return pid_allow;
+    return pid_allow || (bpf_map_lookup_elem(&cgroup_filter, &cg_id) ? 1 : 0);
+#else
+    return pid_allow;
+#endif
+}
+
 #endif /* CGROUP_HELPER_H */
