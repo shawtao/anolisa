@@ -181,6 +181,42 @@ impl RawEvent {
         }
     }
 
+    /// Convert a ProcTrace exec-failure event into a RawEvent.
+    ///
+    /// errors-only: `ret` carries the negative errno (e.g. -2 for ENOENT),
+    /// matching the `RawEvent` error-code dual-field convention. `data_json`
+    /// retains the attempted filename and execveat flags for downstream
+    /// `(container, errno, basename)` aggregation in containersight.
+    pub fn from_proctrace_exec_fail(
+        header: &ProcEventHeader,
+        error_code: i32,
+        flags: u32,
+        filename: &str,
+        ppid: u32,
+    ) -> Self {
+        let data_json = serde_json::json!({
+            "filename": filename,
+            "flags": flags,
+            "errno": -error_code,
+        });
+
+        Self {
+            id: None,
+            timestamp_ms: ns_to_unix_ms(header.timestamp_ns),
+            source: "proctrace".to_owned(),
+            pid: header.pid,
+            ppid,
+            tid: header.tid,
+            uid: header.uid,
+            comm: header_comm(header),
+            cgroup_id: header.cgroup_id,
+            op: "execve_fail".to_owned(),
+            ret: error_code,
+            data_json: data_json.to_string(),
+            count: 1,
+        }
+    }
+
     /// Convert a ProcTrace exit event into a RawEvent.
     pub fn from_proctrace_exit(
         header: &ProcEventHeader,

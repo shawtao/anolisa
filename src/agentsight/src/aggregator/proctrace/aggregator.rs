@@ -66,6 +66,9 @@ impl ProcessEventAggregator {
                 }
             }
             VariableEvent::Unknown(_) => None,
+            // ExecFail never starts/ends a process lifecycle (the address
+            // space was never replaced); it is surfaced only via raw fan-out.
+            VariableEvent::ExecFail { .. } => None,
         }
     }
 

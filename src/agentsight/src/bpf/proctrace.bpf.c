@@ -55,11 +55,28 @@ struct sys_enter_execve_args
     const char *const *envp;
 };
 
-SEC("tp/syscalls/sys_enter_execve")
-int trace_execve_enter(struct sys_enter_execve_args *args)
+// execveat(2) enter layout: leading dfd, trailing flags around the
+// execve-style filename/argv/envp triplet.
+struct sys_enter_execveat_args
 {
-    const char *filename = args->filename;
-    const char *const *argv = args->argv;
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    int __syscall_nr;
+    int dfd;
+    const char *filename;
+    const char *const *argv;
+    const char *const *envp;
+    int flags;
+};
+
+// Shared enter handler for execve(2)/execveat(2): stashes filename + argv
+// into pending_exec_events so the exit side can emit success or failure.
+static __always_inline int do_execve_enter(const char *filename,
+                                           const char *const *argv,
+                                           u32 exec_flags)
+{
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
@@ -115,6 +132,7 @@ int trace_execve_enter(struct sys_enter_execve_args *args)
     event->ptid = ptid;
     event->uid = uid;
     event->event_type = PROCTRACE_EVENT_EXEC;
+    event->exec_flags = exec_flags;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
     // Read executable filename
     bpf_probe_read_user_str(&event->filename, sizeof(event->filename), filename);
@@ -172,6 +190,18 @@ store:
     return 0;
 }
 
+SEC("tp/syscalls/sys_enter_execve")
+int trace_execve_enter(struct sys_enter_execve_args *args)
+{
+    return do_execve_enter(args->filename, args->argv, 0);
+}
+
+SEC("tp/syscalls/sys_enter_execveat")
+int trace_execveat_enter(struct sys_enter_execveat_args *args)
+{
+    return do_execve_enter(args->filename, args->argv, (u32)args->flags);
+}
+
 // Tracepoint for execve exit - only submit event if execve succeeded
 struct sys_exit_execve_args
 {
@@ -186,12 +216,44 @@ struct sys_exit_execve_args
 // Maximum size for exec event (header + exec_data + full args_buf)
 #define MAX_EXEC_EVENT_SIZE (sizeof(struct proc_event_header) + sizeof(struct proc_exec_data) + LAST_ARG)
 
-SEC("tp/syscalls/sys_exit_execve")
-int trace_execve_exit(struct sys_exit_execve_args *args)
+// Emit an errors-only EXEC_FAIL event from a pending enter-side scratch entry.
+// Returns nothing; the caller still owns pending cleanup.
+static __always_inline void emit_exec_fail(struct proc_event_t *pending, long ret, u64 cg_id)
+{
+    struct proc_event_header *event = bpf_ringbuf_reserve(
+        &rb,
+        sizeof(struct proc_event_header) + sizeof(struct proc_exec_fail_data),
+        0);
+    if (!event)
+        return;
+
+    event->source = EVENT_SOURCE_PROC;
+    event->timestamp_ns = pending->timestamp_ns;
+    event->pid = pending->pid;
+    event->tid = pending->tid;
+    event->ppid = pending->ppid;
+    event->ptid = pending->ptid;
+    event->uid = pending->uid;
+    event->event_type = PROCTRACE_EVENT_EXEC_FAIL;
+    event->data_len = sizeof(struct proc_exec_fail_data);
+    for (int i = 0; i < TASK_COMM_LEN; i++)
+        event->comm[i] = pending->comm[i];
+    event->cgroup_id = cg_id;
+
+    struct proc_exec_fail_data *fail = (void *)(event + 1);
+    fail->error_code = (s32)ret;
+    fail->flags = pending->exec_flags;
+    for (int i = 0; i < ARGSIZE; i++)
+        fail->filename[i] = pending->filename[i];
+
+    bpf_ringbuf_submit(event, 0);
+}
+
+// Shared exit handler for execve(2)/execveat(2).
+static __always_inline int do_execve_exit(long ret)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
-    long ret = args->ret;
     u64 cg_id = get_cgroup_id_compat();
 
     // Look up pending event
@@ -200,7 +262,9 @@ int trace_execve_exit(struct sys_exit_execve_args *args)
         return 0;
 
     if (ret != 0) {
-        // execve failed, discard the pending event
+        // execve failed: emit an errors-only EXEC_FAIL event carrying the
+        // attempted filename + errno, then discard the pending scratch entry.
+        emit_exec_fail(pending, ret, cg_id);
         bpf_map_delete_elem(&pending_exec_events, &pid);
         bpf_map_delete_elem(&child_pids, &pid);
         return 0;
@@ -255,6 +319,18 @@ int trace_execve_exit(struct sys_exit_execve_args *args)
     // Clean up pending event
     bpf_map_delete_elem(&pending_exec_events, &pid);
     return 0;
+}
+
+SEC("tp/syscalls/sys_exit_execve")
+int trace_execve_exit(struct sys_exit_execve_args *args)
+{
+    return do_execve_exit(args->ret);
+}
+
+SEC("tp/syscalls/sys_exit_execveat")
+int trace_execveat_exit(struct sys_exit_execve_args *args)
+{
+    return do_execve_exit(args->ret);
 }
 
 // Maximum size for stdout event (header + stdout_data + max payload)

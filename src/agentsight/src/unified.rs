@@ -595,6 +595,21 @@ impl AgentSight {
                         self.fanout_raw(raw);
                     }
                 }
+                VariableEvent::ExecFail { header, error_code, flags, filename } => {
+                    // errors-only execve(at) failure: fan-out to raw channel so
+                    // containersight's ExecFailureDetector can aggregate it.
+                    // No PidTable update (address space was never replaced).
+                    if self.has_raw_sink() {
+                        let ppid = {
+                            let table_ppid = self.pid_table.lookup_ppid(header.pid);
+                            if table_ppid != 0 { table_ppid } else { header.ppid }
+                        };
+                        let raw = crate::raw_event::RawEvent::from_proctrace_exec_fail(
+                            header, *error_code, *flags, filename, ppid,
+                        );
+                        self.fanout_raw(raw);
+                    }
+                }
                 _ => {} // Stdout / Unknown — no raw event fan-out
             }
         }

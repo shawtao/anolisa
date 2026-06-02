@@ -27,9 +27,10 @@ typedef _Bool bool;
 
 // Event types (using unique prefix to avoid conflicts with kernel headers)
 enum proctrace_event_type {
-    PROCTRACE_EVENT_EXEC   = 1,  // Process execution (execve)
-    PROCTRACE_EVENT_STDOUT = 2,  // Stdout output
-    PROCTRACE_EVENT_EXIT   = 3,  // Process exit
+    PROCTRACE_EVENT_EXEC      = 1,  // Process execution (execve)
+    PROCTRACE_EVENT_STDOUT    = 2,  // Stdout output
+    PROCTRACE_EVENT_EXIT      = 3,  // Process exit
+    PROCTRACE_EVENT_EXEC_FAIL = 4,  // execve(2)/execveat(2) failure (errors-only)
 };
 
 // Common event header - all events start with this
@@ -67,6 +68,15 @@ struct proc_exit_data {
     s32 exit_code;          // Process exit code
 };
 
+// Exec failure event data (fixed length, follows header)
+// Emitted only when execve(2)/execveat(2) returns ret < 0 (errors-only path).
+// filename/comm/pid are recovered from the pending enter-side scratch entry.
+struct proc_exec_fail_data {
+    s32  error_code;        // negative errno from sys_exit (e.g. -2 = ENOENT)
+    u32  flags;             // execveat flags (AT_*); 0 for plain execve
+    char filename[ARGSIZE]; // attempted executable path (may be PATH-relative)
+};
+
 // Legacy process event structure (kept for backward compatibility)
 // NOTE: This is kept for existing code, new code should use variable-length events
 struct proc_event_t {
@@ -87,6 +97,7 @@ struct proc_event_t {
     char args_buf[TOTAL_MAX_ARGS * ARGSIZE]; // Argv strings packed end-to-end
     u8  buf[MAX_BUF_SIZE];  // stdout data or other payload
     u64 cgroup_id;          // unified cgroup inode from get_cgroup_id_compat()
+    u32 exec_flags;         // execveat flags stashed on enter; 0 for plain execve
 };
 
 #endif /* __PROCTRACE_H */

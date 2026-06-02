@@ -88,6 +88,10 @@ impl ProcTraceParser {
                 })
             }
             VariableEvent::Unknown(_) => None,
+            // ExecFail is an errors-only signal consumed via the raw-event
+            // fan-out path; it is not part of the exec/stdout/exit lifecycle
+            // timeline, so it produces no ParsedProcEvent.
+            VariableEvent::ExecFail { .. } => None,
         }
     }
 

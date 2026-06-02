@@ -35,12 +35,14 @@ pub type ProcEventHeader = bpf::proc_event_header;
 pub type ProcExecData = bpf::proc_exec_data;
 pub type ProcStdoutData = bpf::proc_stdout_data;
 pub type ProcExitData = bpf::proc_exit_data;
+pub type ProcExecFailData = bpf::proc_exec_fail_data;
 pub type ProcEvent = bpf::proc_event_t;
 
 // Event type constants
 pub const PROCTRACE_EVENT_EXEC: u32 = 1;
 pub const PROCTRACE_EVENT_STDOUT: u32 = 2;
 pub const PROCTRACE_EVENT_EXIT: u32 = 3;
+pub const PROCTRACE_EVENT_EXEC_FAIL: u32 = 4;
 
 /// Variable-length event wrapper that parses data from ring buffer
 #[derive(Debug)]
@@ -58,6 +60,14 @@ pub enum VariableEvent {
     Exit {
         header: ProcEventHeader,
         exit_code: i32,
+    },
+    /// execve(2)/execveat(2) failure (errors-only). `error_code` is the
+    /// negative errno from sys_exit; `filename` is the attempted path.
+    ExecFail {
+        header: ProcEventHeader,
+        error_code: i32,
+        flags: u32,
+        filename: String,
     },
     Unknown(u32),
 }
@@ -80,6 +90,7 @@ impl VariableEvent {
             PROCTRACE_EVENT_EXEC => Self::parse_exec(&header, data),
             PROCTRACE_EVENT_STDOUT => Self::parse_stdout(&header, data),
             PROCTRACE_EVENT_EXIT => Self::parse_exit(&header, data),
+            PROCTRACE_EVENT_EXEC_FAIL => Self::parse_exec_fail(&header, data),
             other => Some(VariableEvent::Unknown(other)),
         }
     }
@@ -199,12 +210,41 @@ impl VariableEvent {
         })
     }
 
+    fn parse_exec_fail(header: &ProcEventHeader, data: &[u8]) -> Option<Self> {
+        let header_size = std::mem::size_of::<ProcEventHeader>();
+        let fail_data_size = std::mem::size_of::<ProcExecFailData>();
+
+        if data.len() < header_size + fail_data_size {
+            return None;
+        }
+
+        // SAFETY: Bounds checked above
+        let fail_data = unsafe { &*(data.as_ptr().add(header_size) as *const ProcExecFailData) };
+
+        // Parse filename (null-terminated)
+        let filename = fail_data
+            .filename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>();
+        let filename = String::from_utf8_lossy(&filename).into_owned();
+
+        Some(VariableEvent::ExecFail {
+            header: *header,
+            error_code: fail_data.error_code,
+            flags: fail_data.flags,
+            filename,
+        })
+    }
+
     /// Get event type as string
     pub fn event_type_str(&self) -> &'static str {
         match self {
             VariableEvent::Exec { .. } => "exec",
             VariableEvent::Stdout { .. } => "stdout",
             VariableEvent::Exit { .. } => "exit",
+            VariableEvent::ExecFail { .. } => "exec_fail",
             VariableEvent::Unknown(_) => "unknown",
         }
     }
@@ -215,6 +255,7 @@ impl VariableEvent {
             VariableEvent::Exec { header, .. } => &header.comm,
             VariableEvent::Stdout { header, .. } => &header.comm,
             VariableEvent::Exit { header, .. } => &header.comm,
+            VariableEvent::ExecFail { header, .. } => &header.comm,
             VariableEvent::Unknown(_) => return String::from("unknown"),
         };
 
@@ -565,6 +606,25 @@ impl ProcTrace {
             .trace_execve_exit()
             .attach()
             .context("failed to attach execve exit tracepoint")?;
+        links.push(link);
+
+        // Attach execveat enter/exit tracepoints. execveat(2) shares the
+        // pending_exec_events scratch + EXEC_FAIL emit path with execve(2),
+        // covering fexecve()/AT_EMPTY_PATH style launches.
+        let link = self
+            .skel
+            .progs_mut()
+            .trace_execveat_enter()
+            .attach()
+            .context("failed to attach execveat enter tracepoint")?;
+        links.push(link);
+
+        let link = self
+            .skel
+            .progs_mut()
+            .trace_execveat_exit()
+            .attach()
+            .context("failed to attach execveat exit tracepoint")?;
         links.push(link);
 
         // Attach write tracepoint (for stdout capture). Skipped when stdout
