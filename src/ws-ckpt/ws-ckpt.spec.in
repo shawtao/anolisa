@@ -79,6 +79,7 @@ install -p -m 0755 scripts/uninstall-hermes.sh %{buildroot}%{_datadir}/anolisa/a
 %doc README.md
 %attr(0755,root,root) %{_localbindir}/ws-ckpt
 %{_unitdir}/ws-ckpt.service
+%dir /etc/ws-ckpt
 /etc/ws-ckpt/config.toml.sample
 %dir %{_datadir}/anolisa/runtime
 %dir %{_datadir}/anolisa/runtime/skills
@@ -89,7 +90,10 @@ install -p -m 0755 scripts/uninstall-hermes.sh %{buildroot}%{_datadir}/anolisa/a
 %post
 if [ $1 -ge 2 ]; then
     # Upgrade: try remove legacy binary from old FHS path
-    rm -f %{_bindir}/ws-ckpt 2>/dev/null || true
+    if [ -e %{_bindir}/ws-ckpt ] && \
+       rpm -qf %{_bindir}/ws-ckpt 2>/dev/null | grep -q '^ws-ckpt-[0-9]'; then
+        rm -f %{_bindir}/ws-ckpt
+    fi
 fi
 systemctl daemon-reload
 systemctl enable ws-ckpt.service
@@ -111,20 +115,17 @@ fi
 
 %postun
 if [ $1 -eq 0 ]; then
-    # BtrfsLoop backend: umount, release loop, remove img.
+    # BtrfsLoop backend: umount, detach loop, then wipe state dirs.
     # The daemon may have been serving on either the canonical FHS path or
     # the pre-FHS legacy path (when migration was deferred); clean up both.
     umount /mnt/btrfs-workspace 2>/dev/null || true
     for img in /var/lib/ws-ckpt/btrfs-data.img /data/ws-ckpt/btrfs-data.img; do
         losetup -j "$img" 2>/dev/null | \
             cut -d: -f1 | xargs -r losetup -d 2>/dev/null || true
-        rm -f "$img" 2>/dev/null || true
     done
     rmdir /mnt/btrfs-workspace 2>/dev/null || true
-    rmdir /data/ws-ckpt 2>/dev/null || true
     # Remove daemon runtime state to avoid stale state on reinstall
-    rm -f /var/lib/ws-ckpt/state.json /var/lib/ws-ckpt/daemon.lock 2>/dev/null || true
-    rmdir /var/lib/ws-ckpt 2>/dev/null || true
+    rm -rf /var/lib/ws-ckpt /data/ws-ckpt 2>/dev/null || true
     systemctl daemon-reload
 fi
 
