@@ -50,20 +50,18 @@ def map_error_to_message(stderr: str, context: Optional[Dict[str, Any]] = None) 
 
     lowered = stderr.lower()
 
-    if "not initialized" in lowered:
-        return f"Workspace not initialized for ws-ckpt.{ctx_str}"
     # CLI environment issues take priority over generic "not found" (snapshot)
     if "binary not found" in lowered or "not found on path" in lowered:
         return f"ws-ckpt CLI not found on PATH.{ctx_str}"
-    if "not found" in lowered or "no such" in lowered:
-        return f"Snapshot not found.{ctx_str}"
-    if "daemon" in lowered or "connection" in lowered:
-        return f"ws-ckpt daemon is not responding. Is it running?{ctx_str}"
-    if "permission" in lowered:
-        return f"Permission denied.{ctx_str}"
     if "timeout" in lowered:
         return f"Command timed out.{ctx_str}"
-    # Order matters: scan-failed (retryable) before occupants-present (hard).
+    if "already exists" in lowered:
+        return f"Snapshot already exists in this workspace. Use a different ID.{ctx_str}"
+    if "active write" in lowered or "write operations" in lowered:
+        return f"Workspace has active write operations. Wait a moment and retry.{ctx_str}"
+    if "insufficient" in lowered:
+        return f"Insufficient disk space for snapshot. Delete old snapshots to free space.{ctx_str}"
+    # daemon flattens anyhow chains via `format!("{:#}", e)`, so inner io errors leak generic substrings.
     if "cwd scan failed" in lowered:
         return (
             "ws-ckpt could not scan /proc to verify workspace occupants "
@@ -78,6 +76,12 @@ def map_error_to_message(stderr: str, context: Optional[Dict[str, Any]] = None) 
             "This is NOT retryable. The user must move affected processes out of the workspace."
             f"{ctx_str}"
         )
+    if "daemon is not running" in lowered or "daemon is starting up" in lowered:
+        return f"ws-ckpt daemon is not responding. Is it running?{ctx_str}"
+    if "not found" in lowered and "snapshot" in lowered:
+        return f"Snapshot not found.{ctx_str}"
+    if "not found" in lowered and "workspace" in lowered:
+        return f"Workspace not found.{ctx_str}"
 
     return f"ws-ckpt error: {stderr.strip()}{ctx_str}"
 

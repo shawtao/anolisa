@@ -31,13 +31,7 @@ export function mapErrorToLLMMessage(stderr: string, context?: { id?: string }):
   if (stderr.includes('Insufficient disk space') || stderr.includes('insufficient')) {
     return 'Insufficient disk space for snapshot. Delete old snapshots to free space.';
   }
-  if (stderr.includes('not found') && stderr.toLowerCase().includes('snapshot')) {
-    return `Snapshot '${context?.id ?? 'unknown'}' not found. Use ws-ckpt-list to view available snapshots.`;
-  }
-  if (stderr.includes('not found') && stderr.toLowerCase().includes('workspace')) {
-    return 'Workspace not found. Use ws-ckpt-init to initialize first.';
-  }
-  // Order matters: scan-failed (retryable) before occupants-present (hard).
+  // daemon flattens anyhow chains via `format!("{:#}", e)`, so inner io errors leak generic substrings.
   if (stderr.includes('cwd scan failed')) {
     return 'ws-ckpt could not scan /proc to verify workspace occupants ' +
       '(typically a transient /proc/canonicalize race). ' +
@@ -47,6 +41,15 @@ export function mapErrorToLLMMessage(stderr: string, context?: { id?: string }):
     return 'Other processes have their working directory inside the workspace. ' +
       'ws-ckpt cannot proceed because the symlink swap would break those processes. ' +
       'This is NOT retryable. The user must move affected processes out of the workspace.';
+  }
+  if (stderr.includes('daemon is not running') || stderr.includes('daemon is starting up')) {
+    return 'ws-ckpt daemon is not responding. Is it running?';
+  }
+  if (stderr.includes('not found') && stderr.toLowerCase().includes('snapshot')) {
+    return `Snapshot '${context?.id ?? 'unknown'}' not found. Use ws-ckpt-list to view available snapshots.`;
+  }
+  if (stderr.includes('not found') && stderr.toLowerCase().includes('workspace')) {
+    return 'Workspace not found. Use ws-ckpt-init to initialize first.';
   }
   // Default: return original stderr cleaned of ANSI codes
   return stderr.replace(/\x1b\[[0-9;]*m/g, '').trim();
