@@ -105,6 +105,25 @@ ws-ckpt status
 ws-ckpt status -w <path-to-workspace
 ```
 
+### config — 查看或修改自动清理策略
+
+`ws-ckpt config` 的作用域由 scope 决定:不带 scope = 只读 overview(全局配置 + workspace 覆盖统计,带任何修改 flag 会报错);`-g` 全局;`-w <workspace>` 局部。
+
+```bash
+# 全局(daemon-wide)
+ws-ckpt config -g                                 # 查看
+ws-ckpt config -g --enable-auto-cleanup
+ws-ckpt config -g --auto-cleanup-keep 30d         # 或整数 20
+
+# 局部(只覆盖本 workspace 的 auto_cleanup / auto_cleanup_keep)
+ws-ckpt config -w <path-to-workspace>             # 三栏视图: effective / local / global
+ws-ckpt config -w <path-to-workspace> --auto-cleanup-keep 5
+ws-ckpt config -w <path-to-workspace> --disable-auto-cleanup
+ws-ckpt config -w <path-to-workspace> --reset     # 删除 policy.toml,沿用全局
+```
+
+`-w` 仅可覆盖 `auto_cleanup` 和 `auto_cleanup_keep`,interval/image/health-check 等是 daemon-wide,带 `-w` 设置会被 CLI 拒绝。
+
 ## 注意事项
 
 - checkpoint 用 `-i` 指定快照 ID;rollback 和 delete 用 `-s` 指定快照 ID,不要混淆

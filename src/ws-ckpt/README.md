@@ -99,23 +99,33 @@ ws-ckpt cleanup --workspace ~/my-workspace --keep 5
 
 ### 状态与配置
 
-配置以 `/etc/ws-ckpt/config.toml` 为唯一持久化入口（参考模板：`/etc/ws-ckpt/config.toml.sample`）。`ws-ckpt config --<flag>` 会写入该文件并通知 daemon reload，两种方式等价。
+配置分两层：**全局**（`/etc/ws-ckpt/config.toml`，daemon-wide 默认值）和**局部**（`/var/lib/ws-ckpt/indexes/<ws_id>/policy.toml`，per-workspace 覆盖）。`ws-ckpt config` 子命令的作用域由 scope 决定：
+
+- 不带 scope：打印只读 overview（全局配置 + workspace 覆盖统计），修改类 flag 会被拒绝
+- `-g` / `--global` 查看或修改全局配置文件
+- `-w <workspace>` / `--workspace <workspace>` 查看或修改单个工作区的 `policy.toml`
 
 ```bash
 # 查看系统状态
 ws-ckpt status --workspace ~/my-workspace
 
-# 查看当前配置
-ws-ckpt config
+# 查看全局配置
+ws-ckpt config -g
 
-# 启用周期性 auto-cleanup
-ws-ckpt config --enable-auto-cleanup
+# 启用周期性 auto-cleanup（全局）
+ws-ckpt config -g --enable-auto-cleanup
 
-# 按数量或时间维度设置保留策略
-ws-ckpt config --auto-cleanup-keep 10
-ws-ckpt config --auto-cleanup-keep 30d
+# 全局保留策略（按数量或时间维度）
+ws-ckpt config -g --auto-cleanup-keep 10
+ws-ckpt config -g --auto-cleanup-keep 30d
 
-# 手工修改 config.toml 后热生效
+# 单个工作区的覆盖（仅 auto_cleanup / auto_cleanup_keep 可 per-ws 覆盖）
+ws-ckpt config -w ~/my-workspace                       # 三栏视图: effective / local / global
+ws-ckpt config -w ~/my-workspace --auto-cleanup-keep 5 # 仅这个 ws 保留 5 份
+ws-ckpt config -w ~/my-workspace --disable-auto-cleanup
+ws-ckpt config -w ~/my-workspace --reset               # 删除局部 policy.toml,沿用全局
+
+# 手工修改 config.toml / policy.toml 后热生效
 ws-ckpt reload
 ```
 

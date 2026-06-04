@@ -176,26 +176,49 @@ ws-ckpt status -w ./my-project
 
 ### 2.8 查看或修改配置
 
-配置以 `/etc/ws-ckpt/config.toml` 为持久化入口，`ws-ckpt config --<flag>` 写入该文件并通知 daemon reload。
+配置分两层:**全局**(`/etc/ws-ckpt/config.toml`,daemon-wide 默认值)和**局部**(`/var/lib/ws-ckpt/indexes/<ws_id>/policy.toml`,per-workspace 覆盖)。`ws-ckpt config` 通过 scope 决定作用范围:
+
+- 不带 scope:打印只读 overview(全局配置 + workspace 覆盖统计),修改类 flag 会被拒绝
+- `-g` / `--global` 查看或修改全局
+- `-w <workspace>` / `--workspace <workspace>` 查看或修改单个 workspace 的 `policy.toml`
+
+`-w` 只能覆盖 `auto_cleanup` 与 `auto_cleanup_keep`,其他字段(interval / image / health check)是 daemon-wide,只能 `-g` 设置。
 
 ```bash
-# 查看当前配置
-ws-ckpt config
+# === 全局 ===
+# 查看
+ws-ckpt config -g
 
 # 开/关后台 auto-cleanup
-ws-ckpt config --enable-auto-cleanup
-ws-ckpt config --disable-auto-cleanup
+ws-ckpt config -g --enable-auto-cleanup
+ws-ckpt config -g --disable-auto-cleanup
 
-# 保留策略：整数=按数量，时长=按时间（单位 s/m/h/d/w）
-ws-ckpt config --auto-cleanup-keep 10
-ws-ckpt config --auto-cleanup-keep 30d
+# 保留策略:整数=按数量,时长=按时间(单位 s/m/h/d/w)
+ws-ckpt config -g --auto-cleanup-keep 10
+ws-ckpt config -g --auto-cleanup-keep 30d
 
-# 调度 / 健康检查间隔（秒，0 禁用）
-ws-ckpt config --auto-cleanup-interval 3600
-ws-ckpt config --health-check-interval 300
+# 调度 / 健康检查间隔(秒,0 禁用)
+ws-ckpt config -g --auto-cleanup-interval 3600
+ws-ckpt config -g --health-check-interval 300
 
-# BtrfsLoop 镜像容量（指定后需要重启 daemon 生效）
-ws-ckpt config --img-size 30 --img-max-percent 40
+# BtrfsLoop 镜像容量(指定后需要重启 daemon 生效)
+ws-ckpt config -g --img-size 30 --img-max-percent 40
+
+# === 局部(per-workspace 覆盖) ===
+# 三栏视图: effective / local / global
+ws-ckpt config -w ~/proj
+
+# 这个 workspace 单独保留 5 份
+ws-ckpt config -w ~/proj --auto-cleanup-keep 5
+
+# 这个 workspace 关掉 auto-cleanup,即便全局是开的
+ws-ckpt config -w ~/proj --disable-auto-cleanup
+
+# 这个 workspace 反之: 全局关闭时单独打开
+ws-ckpt config -w ~/proj --enable-auto-cleanup
+
+# 删除该 workspace 的 policy.toml,回到沿用全局
+ws-ckpt config -w ~/proj --reset
 ```
 
 ### 2.9 重新加载配置
