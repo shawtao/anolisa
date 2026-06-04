@@ -143,6 +143,13 @@ pub async fn init(state: &Arc<DaemonState>, workspace: &str) -> anyhow::Result<R
             ));
         }
     };
+    // Reject non-UTF-8: lossy survives in manifest and breaks fs ops after daemon restart.
+    if abs_path.to_str().is_none() {
+        return Ok(error_resp(
+            ErrorCode::InvalidPath,
+            format!("resolved path is not valid UTF-8: {}", abs_path.display()),
+        ));
+    }
     if abs_path.to_string_lossy() != workspace {
         info!(
             "workspace path resolved: {} -> {}",
@@ -688,6 +695,37 @@ mod tests {
         match resp {
             Response::InitOk { ws_id } => assert_eq!(ws_id, "ws-exist"),
             _ => panic!("expected InitOk for already-initialized workspace"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_rejects_non_utf8_canonicalized_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Real directory with a non-UTF-8 byte (\xFF) in its name.
+        let raw_name = OsStr::from_bytes(b"non-utf8-\xFFdir");
+        let raw_dir = tmpdir.path().join(raw_name);
+        tokio::fs::create_dir(&raw_dir).await.unwrap();
+        // ASCII symlink so the user-facing path is valid UTF-8 but resolves to
+        // the non-UTF-8 directory after canonicalize.
+        let link = tmpdir.path().join("ascii-link");
+        tokio::fs::symlink(&raw_dir, &link).await.unwrap();
+
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            test_backend(),
+            test_state_dir(),
+        ));
+        let resp = init(&state, &link.to_string_lossy()).await.unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidPath);
+                assert!(message.contains("not valid UTF-8"), "message: {}", message);
+            }
+            _ => panic!("expected InvalidPath error for non-UTF-8 canonicalized path"),
         }
     }
 
