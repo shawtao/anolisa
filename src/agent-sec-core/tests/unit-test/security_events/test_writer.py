@@ -674,6 +674,47 @@ class TestWriterFireAndForget:
 
         assert captured == [boom]
 
+    def test_write_invokes_on_error_for_rotation_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[Exception] = []
+        path = tmp_path / "events.jsonl"
+        path.write_text("x" * 20, encoding="utf-8")
+        writer = JsonlEventWriter(path=path, max_bytes=1, on_error=captured.append)
+        boom = OSError("cannot rotate")
+
+        def _raise_move(_src: object, _dst: object) -> None:
+            raise boom
+
+        monkeypatch.setattr(
+            "agent_sec_cli.security_events.writer.shutil.move",
+            _raise_move,
+        )
+
+        writer.write({"k": "v"})
+
+        assert captured == [boom]
+        assert path.exists()
+
+    def test_cleanup_invokes_on_error_for_unlink_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[Exception] = []
+        path = tmp_path / "events.jsonl"
+        backup = tmp_path / "events.jsonl.20260101-120000.000"
+        backup.write_text("old\n", encoding="utf-8")
+        writer = JsonlEventWriter(path=path, backup_count=0, on_error=captured.append)
+        boom = OSError("cannot unlink")
+
+        def _raise_unlink(_path: Path) -> None:
+            raise boom
+
+        monkeypatch.setattr(Path, "unlink", _raise_unlink)
+
+        writer._cleanup_old_backups()
+
+        assert captured == [boom]
+
     def test_write_swallows_on_error_callback_failure(self, tmp_path: Path) -> None:
         """A misbehaving ``on_error`` (e.g. raises) must not surface to the
         caller — the writer's fire-and-forget contract is preserved.

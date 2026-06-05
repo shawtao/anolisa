@@ -86,6 +86,15 @@ class JsonlEventWriter:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _notify_error(self, exc: Exception) -> None:
+        """Best-effort diagnostic callback for swallowed writer failures."""
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(exc)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _ensure_parent_dir(self) -> None:
         if self._dir_created:
             return
@@ -126,7 +135,8 @@ class JsonlEventWriter:
         # Rotate current file to timestamp-named backup
         try:
             shutil.move(self._path, backup_path)
-        except OSError:
+        except OSError as exc:
+            self._notify_error(exc)
             return
 
         # Clean up old backups exceeding backup_count
@@ -210,9 +220,11 @@ class JsonlEventWriter:
                 oldest_path, _ = backup_files.pop(0)
                 try:
                     oldest_path.unlink()
-                except OSError:
+                except OSError as exc:
+                    self._notify_error(exc)
                     pass
-        except OSError:
+        except OSError as exc:
+            self._notify_error(exc)
             pass
 
     # ------------------------------------------------------------------
@@ -235,11 +247,7 @@ class JsonlEventWriter:
             try:
                 self._append_record(record)
             except Exception as exc:  # noqa: BLE001
-                if self._on_error is not None:
-                    try:
-                        self._on_error(exc)
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._notify_error(exc)
 
     def write_or_raise(self, record: Mapping[str, Any]) -> None:
         """Serialize *record* and append it as a single JSONL line.

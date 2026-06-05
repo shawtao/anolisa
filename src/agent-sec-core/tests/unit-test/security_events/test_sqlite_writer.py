@@ -793,6 +793,7 @@ class TestSqliteEventWriter:
         event = _make_event(event_type="busy_corruption_retry")
         writer = SqliteEventWriter(path=db_path)
         calls = 0
+        dispose_calls: list[None] = []
 
         def corrupt_then_busy(_event: SecurityEvent) -> bool:
             nonlocal calls
@@ -801,8 +802,12 @@ class TestSqliteEventWriter:
                 raise DatabaseError("INSERT", {}, CorruptError())
             raise _busy_database_error()
 
+        def _track_dispose() -> None:
+            dispose_calls.append(None)
+
         monkeypatch.setattr(writer._repository, "insert", corrupt_then_busy)
         monkeypatch.setattr(writer._store, "handle_corruption", lambda _exc: None)
+        monkeypatch.setattr(writer._store, "dispose", _track_dispose)
 
         with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
             writer.write(event)
@@ -819,6 +824,37 @@ class TestSqliteEventWriter:
         assert record.data["event_id"] == event.event_id
         assert record.data["event_type"] == "busy_corruption_retry"
         assert record.data["error_type"] == "BusyError"
+        assert dispose_calls == []
+
+    def test_write_disposes_on_corruption_retry_error(
+        self, db_path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class CorruptError(Exception):
+            sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+
+        event = _make_event(event_type="corruption_retry_error")
+        writer = SqliteEventWriter(path=db_path)
+        calls = 0
+        dispose_calls: list[None] = []
+
+        def corrupt_then_sqlalchemy(_event: SecurityEvent) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DatabaseError("INSERT", {}, CorruptError())
+            raise SQLAlchemyError("retry driver fault")
+
+        def _track_dispose() -> None:
+            dispose_calls.append(None)
+
+        monkeypatch.setattr(writer._repository, "insert", corrupt_then_sqlalchemy)
+        monkeypatch.setattr(writer._store, "handle_corruption", lambda _exc: None)
+        monkeypatch.setattr(writer._store, "dispose", _track_dispose)
+
+        writer.write(event)
+
+        assert calls == 2
+        assert len(dispose_calls) == 1
 
     def test_write_disposes_on_sqlalchemy_error(
         self, db_path: str, monkeypatch: pytest.MonkeyPatch

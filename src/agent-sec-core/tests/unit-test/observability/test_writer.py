@@ -20,6 +20,7 @@ from agent_sec_cli.observability.models import (
 from agent_sec_cli.observability.schema import validate_observability_record
 from agent_sec_cli.observability.sqlite_writer import ObservabilitySqliteWriter
 from agent_sec_cli.observability.writer import ObservabilityWriter
+from sqlalchemy.exc import DatabaseError
 
 
 def test_observability_package_import_does_not_load_sqlalchemy() -> None:
@@ -195,9 +196,48 @@ def test_observability_sqlite_write_or_raise_surfaces_skipped_insert(
     record = validate_observability_record(_payload())
     writer = ObservabilitySqliteWriter(path=tmp_path / "observability.db")
     writer._repository = SkippingRepository()
+    dispose_calls: list[None] = []
+    original_dispose = writer._store.dispose
+
+    def _track_dispose() -> None:
+        dispose_calls.append(None)
+        original_dispose()
+
+    writer._store.dispose = _track_dispose  # type: ignore[method-assign]
 
     with pytest.raises(OSError, match="observability SQLite write was skipped"):
         writer.write_or_raise(record)
+
+    assert dispose_calls == []
+
+
+def test_observability_sqlite_write_or_raise_reports_busy_without_dispose(
+    tmp_path: Path,
+) -> None:
+    class BusyError(Exception):
+        sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    class BusyRepository:
+        def insert_or_raise(self, record: object) -> bool:
+            raise DatabaseError("INSERT", {}, BusyError("database is locked"))
+
+    record = validate_observability_record(_payload())
+    writer = ObservabilitySqliteWriter(path=tmp_path / "observability.db")
+    writer._repository = BusyRepository()
+
+    dispose_calls: list[None] = []
+    original_dispose = writer._store.dispose
+
+    def _track_dispose() -> None:
+        dispose_calls.append(None)
+        original_dispose()
+
+    writer._store.dispose = _track_dispose  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="observability SQLite database is busy"):
+        writer.write_or_raise(record)
+
+    assert dispose_calls == []
 
 
 def test_observability_repository_insert_returns_false_for_validation_error_without_dispose(

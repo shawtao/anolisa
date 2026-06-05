@@ -17,6 +17,7 @@ from agent_sec_cli.observability.repositories import (
 from agent_sec_cli.observability.schema import ObservabilityRecord
 from agent_sec_cli.security_events.orm_store import (
     SqliteStore,
+    _is_sqlite_busy_error,
     _is_sqlite_corruption_error,
     _is_sqlite_schema_error,
 )
@@ -81,11 +82,12 @@ class ObservabilitySqliteWriter:
             raise OSError("observability SQLite store is disabled")
 
         try:
-            if not self._repository.insert_or_raise(record):
-                raise OSError("observability SQLite write was skipped")
+            inserted = self._repository.insert_or_raise(record)
         except (ValueError, TypeError):
             raise
         except DatabaseError as exc:
+            if _is_sqlite_busy_error(exc):
+                raise OSError("observability SQLite database is busy") from exc
             if not _is_sqlite_corruption_error(exc):
                 if _is_sqlite_schema_error(exc):
                     self._store.request_schema_repair()
@@ -94,16 +96,24 @@ class ObservabilitySqliteWriter:
             if self._store.disabled:
                 raise OSError("observability SQLite store is disabled") from exc
             try:
-                if not self._repository.insert_or_raise(record):
-                    raise OSError("observability SQLite write was skipped")
+                inserted = self._repository.insert_or_raise(record)
             except (ValueError, TypeError):
                 raise
+            except DatabaseError as retry_exc:
+                if _is_sqlite_busy_error(retry_exc):
+                    raise OSError(
+                        "observability SQLite database is busy"
+                    ) from retry_exc
+                self._store.dispose()
+                raise retry_exc from exc
             except Exception as retry_exc:  # noqa: BLE001
                 self._store.dispose()
                 raise retry_exc from exc
         except (SQLAlchemyError, OSError):
             self._store.dispose()
             raise
+        if not inserted:
+            raise OSError("observability SQLite write was skipped")
 
     def close(self) -> None:
         """Best-effort gated prune/WAL checkpoint and dispose pooled connections."""

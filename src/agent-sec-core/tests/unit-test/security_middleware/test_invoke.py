@@ -96,6 +96,36 @@ class TestInvoke(unittest.TestCase):
         self.assertGreaterEqual(record.data["duration_ms"], 0)
 
     @patch("agent_sec_cli.security_middleware.router.get_backend")
+    @patch("agent_sec_cli.security_middleware.lifecycle.post_action")
+    @patch("agent_sec_cli.security_middleware.lifecycle.pre_action")
+    def test_invoke_success_duration_includes_post_action(
+        self, mock_pre, mock_post, mock_get_backend
+    ):
+        clock = {"now": 10.0}
+
+        def fake_perf_counter():
+            return clock["now"]
+
+        def advance_clock(*_args, **_kwargs):
+            clock["now"] = 12.5
+
+        mock_backend = MagicMock()
+        mock_backend.execute.return_value = ActionResult(success=False, exit_code=7)
+        mock_get_backend.return_value = mock_backend
+        mock_post.side_effect = advance_clock
+
+        with patch(
+            "agent_sec_cli.security_middleware.time.perf_counter",
+            fake_perf_counter,
+        ):
+            with self.assertLogs(
+                "agent_sec_cli.security_middleware", level="WARNING"
+            ) as cm:
+                invoke("code_scan", code="danger")
+
+        self.assertEqual(cm.records[0].data["duration_ms"], 2500)
+
+    @patch("agent_sec_cli.security_middleware.router.get_backend")
     @patch("agent_sec_cli.security_middleware.lifecycle.on_error")
     @patch("agent_sec_cli.security_middleware.lifecycle.pre_action")
     def test_invoke_logs_backend_exception_as_error(
@@ -117,6 +147,37 @@ class TestInvoke(unittest.TestCase):
         self.assertEqual(record.data["action"], "code_scan")
         self.assertIsNotNone(record.exc_info)
         self.assertIs(record.exc_info[0], RuntimeError)
+
+    @patch("agent_sec_cli.security_middleware.router.get_backend")
+    @patch("agent_sec_cli.security_middleware.lifecycle.on_error")
+    @patch("agent_sec_cli.security_middleware.lifecycle.pre_action")
+    def test_invoke_error_duration_includes_on_error(
+        self, mock_pre, mock_on_error, mock_get_backend
+    ):
+        clock = {"now": 10.0}
+
+        def fake_perf_counter():
+            return clock["now"]
+
+        def advance_clock(*_args, **_kwargs):
+            clock["now"] = 12.5
+
+        mock_backend = MagicMock()
+        mock_backend.execute.side_effect = RuntimeError("backend boom")
+        mock_get_backend.return_value = mock_backend
+        mock_on_error.side_effect = advance_clock
+
+        with patch(
+            "agent_sec_cli.security_middleware.time.perf_counter",
+            fake_perf_counter,
+        ):
+            with self.assertLogs(
+                "agent_sec_cli.security_middleware", level="ERROR"
+            ) as cm:
+                with self.assertRaises(RuntimeError):
+                    invoke("code_scan", code="danger")
+
+        self.assertEqual(cm.records[0].data["duration_ms"], 2500)
 
 
 if __name__ == "__main__":

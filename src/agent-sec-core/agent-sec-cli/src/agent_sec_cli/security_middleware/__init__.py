@@ -102,6 +102,7 @@ def invoke(action: str, **kwargs: Any) -> ActionResult:
     try:
         result = backend.execute(ctx, **kwargs)
     except Exception as exc:
+        lifecycle.on_error(ctx, exc, kwargs, backend)
         duration_ms = (time.perf_counter() - started_at) * 1000
         logger.error(
             "backend raised an exception",
@@ -115,7 +116,6 @@ def invoke(action: str, **kwargs: Any) -> ActionResult:
                 },
             },
         )
-        lifecycle.on_error(ctx, exc, kwargs, backend)
         raise
 
     lifecycle.post_action(ctx, result, kwargs, backend)

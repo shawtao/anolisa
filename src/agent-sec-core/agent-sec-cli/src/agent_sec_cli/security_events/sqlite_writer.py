@@ -82,12 +82,15 @@ class SqliteEventWriter:
                 try:
                     self._repository.insert(event)
                 except Exception as retry_exc:  # noqa: BLE001
+                    busy = _is_sqlite_busy_error(retry_exc)
                     self._log_drop(
                         event,
                         retry_exc,
                         "corruption_retry",
-                        busy=_is_sqlite_busy_error(retry_exc),
+                        busy=busy,
                     )
+                    if not busy:
+                        self._store.dispose()
             except (SQLAlchemyError, OSError) as exc:
                 self._log_drop(event, exc, "io")
                 self._store.dispose()
